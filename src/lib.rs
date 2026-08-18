@@ -1,12 +1,18 @@
-//! A coinswap maker, run and supervised from inside BTCPay Server.
+//! Coinswap inside BTCPay Server: a maker, a taker, or both.
 //!
-//! Maker side only. The maker keeps its own wallet under the plugin's data directory: it is not
-//! a BTCPay store wallet, and money in it is not money in a store.
+//! Both roles are off until switched on, and either can run without the other.
+//!
+//! Each role keeps its own wallet under the plugin's data directory, with its own recovery
+//! phrase. Neither is a BTCPay store wallet, and money in them is not money in a store. A swap
+//! gains privacy for coins in the taker wallet, so the flow is fund, swap, withdraw elsewhere.
+//!
+//! Swapping itself is not built yet; the taker's wallet is.
 //!
 //! - [`settings`] is what the operator fills in, and the one place it becomes a
 //!   `MakerServerConfig`.
 //! - [`maker`] owns the maker's thread.
-//! - [`shared`] is what any role needs: the phase, the logger, the lock helper.
+//! - [`taker`] owns the taker's wallet, a separate wallet from the maker's.
+//! - [`shared`] is what both roles need: the phase, the logger, the lock helpers.
 //! - [`logging`] routes coinswap's own log output into BTCPay's.
 //! - This module is the glue: pages, commands, and reacting to a settings change.
 
@@ -17,6 +23,7 @@ pub mod logging;
 pub mod maker;
 pub mod settings;
 pub mod shared;
+pub mod taker;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -27,6 +34,7 @@ use btcpay_plugin::prelude::*;
 use maker::{MakerRuntime, Status};
 use settings::Settings;
 use shared::{lock, Logger, Phase};
+use taker::TakerRuntime;
 
 /// How long a drain command waits for an idle swap to wind up.
 ///
@@ -42,6 +50,7 @@ const STOP_DEADLINE: Duration = Duration::from_secs(30);
 #[derive(Default)]
 pub struct CoinswapPlugin {
     maker: MakerRuntime,
+    taker: TakerRuntime,
     /// Cached so rendering a page does not re-read storage field by field across the FFI
     /// boundary.
     settings: Mutex<Option<Settings>>,
@@ -75,6 +84,147 @@ impl CoinswapPlugin {
     /// A subdirectory, so the wallet does not sit alongside whatever else the plugin writes.
     fn maker_dir(host: &dyn HostServices) -> PathBuf {
         PathBuf::from(host.data_dir()).join("maker")
+    }
+
+    /// Where the taker keeps its wallet. A sibling of the maker's, never the same directory.
+    fn taker_dir(host: &dyn HostServices) -> PathBuf {
+        PathBuf::from(host.data_dir()).join("taker")
+    }
+
+    /// Brings the taker's wallet into line with the settings.
+    ///
+    /// Separate from `reconcile` so either role's failure cannot stop the other.
+    fn reconcile_taker(&self, settings: &Settings) -> Result<String, String> {
+        let Some(host) = self.host() else {
+            return Err("The plugin has not finished starting yet.".to_string());
+        };
+        let logger = Self::logger(Arc::clone(&host));
+
+        if !settings.taker_enabled {
+            if self.taker.is_live() {
+                return Ok(if self.taker.stop(STOP_DEADLINE, &logger) {
+                    "Taker wallet closed.".to_string()
+                } else {
+                    "Taker wallet was asked to close but did not finish in time.".to_string()
+                });
+            }
+            return Ok("Taker is off.".to_string());
+        }
+
+        settings.check()?;
+
+        if self.taker.is_live() {
+            self.taker.stop(STOP_DEADLINE, &logger);
+        }
+
+        let dir = Self::taker_dir(host.as_ref());
+        std::fs::create_dir_all(&dir).map_err(|error| {
+            format!(
+                "Could not create the taker directory at {}: {error}",
+                dir.display()
+            )
+        })?;
+
+        self.taker.start(settings.to_taker_config(dir), logger)?;
+
+        Ok("Taker wallet is opening. Reload the taker page to see it.".to_string())
+    }
+
+    /// Builds the taker wallet page.
+    fn taker_page(&self) -> Document {
+        let settings = self.settings();
+        let status = self.taker.status();
+
+        let mut page = Document::new("Coinswap taker");
+
+        // Names which wallet it belongs to: two roles means two phrases.
+        if let Some(words) = self.taker.take_new_mnemonic() {
+            page = page
+                .alert(
+                    AlertLevel::Warning,
+                    "A new taker wallet was created. Write down the recovery phrase below now. \
+                     It is shown once and stored nowhere this page can read again. This is the \
+                     taker's wallet, a different wallet from the maker's, with its own phrase.",
+                )
+                .text(words);
+        }
+
+        page = match &status.phase {
+            Phase::Failed(reason) => page.alert(
+                AlertLevel::Danger,
+                format!("The taker wallet did not open: {reason}"),
+            ),
+            Phase::Starting => page.alert(
+                AlertLevel::Info,
+                "The taker wallet is opening. It scans the chain on first use, which takes a \
+                 while.",
+            ),
+            Phase::Running => page.alert(
+                AlertLevel::Info,
+                "This wallet is the taker's own. Coins get here because somebody sent them, and \
+                 leave because somebody withdrew them. It is not a BTCPay store wallet, and a \
+                 swap gains privacy only for coins held here.",
+            ),
+            Phase::Stopped if !settings.taker_enabled => page.alert(
+                AlertLevel::Info,
+                "The taker is off. Turn on \"Enable the taker wallet\" on the settings page.",
+            ),
+            Phase::Stopped => page.alert(
+                AlertLevel::Warning,
+                "The taker is enabled but its wallet is not open.",
+            ),
+        };
+
+        // An interrupted swap leaves funds in timelocked contracts, so this outranks the balance.
+        if status.recovery_complete == Some(false) {
+            page = page.alert(
+                AlertLevel::Warning,
+                "A previous swap was interrupted and is still being recovered. Its funds are in \
+                 timelocked contracts until that finishes. Do not start another swap yet.",
+            );
+        }
+
+        let mut stats = Stats::new().card("Status", Self::phase_label(&status.phase));
+
+        if status.wallet_busy {
+            stats = stats
+                .card("Balances", "Busy")
+                .detail("The wallet is locked right now; reload in a moment.");
+        }
+
+        if let Some(balances) = &status.balances {
+            stats = stats
+                .card("Spendable", Self::sats(balances.spendable.to_sat()))
+                .card("In swaps", Self::sats(balances.swap.to_sat()))
+                .card("In contracts", Self::sats(balances.contract.to_sat()))
+                .detail("Locked until a swap finishes or its timelock expires.");
+        }
+
+        page = page.stats(stats);
+
+        if self.taker.wallet_open() {
+            page = page
+                .actions(
+                    Actions::new()
+                        .title("Funding")
+                        .button(Button::new("taker-address", "Show a funding address").primary()),
+                )
+                // A form, not a command: a button carries neither address nor amount. Arrives
+                // as `FormSubmitted` because its id is not "settings".
+                .form(
+                    Form::new("withdraw")
+                        .title("Withdraw")
+                        .text("address", "Destination address")
+                        .required()
+                        .help("Checked against this wallet's network before anything is signed.")
+                        .number("sats", "Amount (sats)")
+                        .required()
+                        .range(1, i64::MAX)
+                        .submit_label("Withdraw"),
+                );
+        }
+
+        page
     }
 
     /// Brings the maker into line with the settings: running when enabled, stopped when not.
@@ -297,6 +447,49 @@ impl CoinswapPlugin {
         format!("{grouped} sats")
     }
 
+    /// Sends funds out of the taker wallet.
+    ///
+    /// The amount is parsed here rather than trusted to the host's own validation.
+    fn withdraw(&self, values: &std::collections::HashMap<String, String>) -> Vec<PluginAction> {
+        let address = values
+            .get("address")
+            .map(String::as_str)
+            .unwrap_or_default();
+
+        let outcome = match values.get("sats").map(|sats| sats.trim().parse::<u64>()) {
+            Some(Ok(sats)) => self
+                .taker
+                .withdraw(address, sats, None)
+                .map(|txid| format!("Withdrawal broadcast. Transaction {txid}.")),
+            Some(Err(_)) => Err("The amount must be a whole number of sats.".to_string()),
+            None => Err("The amount is missing.".to_string()),
+        };
+
+        Self::report(outcome, "withdraw")
+    }
+
+    /// Turns an outcome into what the host should do about it.
+    ///
+    /// Failures are logged as well as shown: a page message dies with the page.
+    fn report(outcome: Result<String, String>, what: &str) -> Vec<PluginAction> {
+        match outcome {
+            Ok(text) => vec![PluginAction::ShowMessage {
+                level: MessageLevel::Success,
+                text,
+            }],
+            Err(text) => vec![
+                PluginAction::Log {
+                    level: LogLevel::Error,
+                    message: format!("{what} failed: {text}"),
+                },
+                PluginAction::ShowMessage {
+                    level: MessageLevel::Error,
+                    text,
+                },
+            ],
+        }
+    }
+
     /// Runs a button press.
     ///
     /// Every arm reports something: a button that appears to do nothing looks like a failure.
@@ -326,6 +519,12 @@ impl CoinswapPlugin {
                 }
                 None => Err("The plugin has not finished starting yet.".to_string()),
             },
+            "taker-address" => self.taker.receive_address().map(|address| {
+                format!(
+                    "Send funds to {address} to top up the taker wallet. This is the taker's own \
+                     wallet, not a store wallet. The address advances each time."
+                )
+            }),
             "address" => self.maker.receive_address().map(|address| {
                 format!(
                     "Send funds to {address} -- this is the maker's own wallet, not a store \
@@ -372,21 +571,29 @@ impl Plugin for CoinswapPlugin {
         *lock(&self.host) = Some(Arc::clone(&host));
         *lock(&self.settings) = Some(settings.clone());
 
-        if !settings.enabled {
+        // Neither failure fails the load: this plugin owns the only page that can fix it.
+        // Reported separately so an operator can see which role is unhappy.
+        if settings.enabled {
+            if let Err(error) = self.reconcile(&settings) {
+                host.log(
+                    LogLevel::Error,
+                    format!("The maker did not start: {error}. Fix it on the settings page."),
+                );
+            }
+        } else {
             host.log(
                 LogLevel::Info,
                 "Coinswap maker is off. Turn it on from the settings page.".to_string(),
             );
-            return Ok(());
         }
 
-        // A bad configuration must not fail the load: this plugin owns the only page that can
-        // fix it.
-        if let Err(error) = self.reconcile(&settings) {
-            host.log(
-                LogLevel::Error,
-                format!("The maker did not start: {error}. Fix it on the settings page."),
-            );
+        if settings.taker_enabled {
+            if let Err(error) = self.reconcile_taker(&settings) {
+                host.log(
+                    LogLevel::Error,
+                    format!("The taker wallet did not open: {error}."),
+                );
+            }
         }
 
         Ok(())
@@ -394,8 +601,11 @@ impl Plugin for CoinswapPlugin {
 
     fn stop(&self) {
         let logger = self.host().map_or_else(Logger::silent, Self::logger);
+        // The maker first: it has counterparties waiting, so it gets the larger share of the
+        // shutdown budget.
         self.maker.stop(STOP_DEADLINE, &logger);
-        // After the stop, so anything logged on the way down is still delivered.
+        self.taker.stop(STOP_DEADLINE, &logger);
+        // After both, so anything logged on the way down is still delivered.
         logging::detach();
     }
 
@@ -411,12 +621,16 @@ impl Plugin for CoinswapPlugin {
     }
 
     fn pages(&self) -> Vec<PageInfo> {
-        vec![PageInfo::new("dashboard", "Maker dashboard")]
+        vec![
+            PageInfo::new("dashboard", "Maker dashboard"),
+            PageInfo::new("taker", "Taker wallet"),
+        ]
     }
 
     fn page(&self, id: String) -> Result<UiDocument, PluginError> {
         match id.as_str() {
             "dashboard" => Ok(self.dashboard().into()),
+            "taker" => Ok(self.taker_page().into()),
             _ => Ok(UiDocument::empty()),
         }
     }
@@ -435,18 +649,32 @@ impl Plugin for CoinswapPlugin {
                 let mut actions = vec![PluginAction::SaveSettings {
                     values: settings.to_values(),
                 }];
-                actions.push(match self.reconcile(&settings) {
-                    Ok(message) => PluginAction::ShowMessage {
-                        level: MessageLevel::Success,
-                        text: message,
-                    },
-                    Err(error) => PluginAction::ShowMessage {
-                        level: MessageLevel::Error,
-                        text: format!("Settings saved, but the maker did not start: {error}"),
-                    },
-                });
+
+                // Both outcomes reported, or a taker-only save would say nothing about it.
+                for (role, outcome) in [
+                    ("maker", self.reconcile(&settings)),
+                    ("taker", self.reconcile_taker(&settings)),
+                ] {
+                    actions.push(match outcome {
+                        Ok(message) => PluginAction::ShowMessage {
+                            level: MessageLevel::Success,
+                            text: message,
+                        },
+                        Err(error) => PluginAction::ShowMessage {
+                            level: MessageLevel::Error,
+                            text: format!("Settings saved, but the {role} did not start: {error}"),
+                        },
+                    });
+                }
                 Ok(actions)
             }
+
+            // Delivered separately from a settings save, so asking for an address cannot be
+            // mistaken for reconfiguring the plugin.
+            HostEvent::FormSubmitted { form_id, values } => match form_id.as_str() {
+                "withdraw" => Ok(self.withdraw(&values)),
+                other => Err(PluginError::invalid_input(format!("unknown form: {other}"))),
+            },
 
             HostEvent::CommandInvoked { command, .. } => Ok(self.run_command(&command)),
 
@@ -465,11 +693,10 @@ mod tests {
     }
 
     #[test]
-    fn the_plugin_offers_a_settings_page_and_a_dashboard() {
+    fn the_plugin_offers_a_settings_page_and_one_page_per_role() {
         let plugin = CoinswapPlugin::default();
-        let pages = plugin.pages();
-        assert_eq!(pages.len(), 1);
-        assert_eq!(pages[0].id, "dashboard");
+        let ids: Vec<_> = plugin.pages().into_iter().map(|page| page.id).collect();
+        assert_eq!(ids, vec!["dashboard", "taker"]);
         assert!(plugin.settings_schema().document_json.contains("\"form\""));
     }
 
@@ -622,5 +849,104 @@ mod tests {
         assert_eq!(plugin.settings().core_password, "stored-password");
         assert_eq!(plugin.settings().tor_auth_password, "stored-tor-password");
         assert_eq!(plugin.settings().core_user, "someone");
+    }
+
+    /// The taker page as JSON, which is how the host sees it.
+    fn taker_json(plugin: &CoinswapPlugin) -> String {
+        plugin.page("taker".to_string()).unwrap().document_json
+    }
+
+    #[test]
+    fn the_taker_page_renders_before_the_plugin_has_started() {
+        let json = taker_json(&CoinswapPlugin::default());
+        assert!(json.contains("Stopped"));
+        assert!(json.contains("settings page"));
+    }
+
+    #[test]
+    fn the_taker_page_offers_nothing_that_needs_an_open_wallet() {
+        // Both need the wallet, so neither is offered until it is open.
+        let json = taker_json(&CoinswapPlugin::default());
+        assert!(!json.contains("taker-address"));
+        assert!(!json.contains("\"withdraw\""));
+    }
+
+    #[test]
+    fn the_taker_page_says_the_wallet_is_not_a_store_wallet() {
+        // The single most likely misunderstanding: that swapping here privatises store funds.
+        let plugin = CoinswapPlugin::default();
+        *lock(&plugin.settings) = Some(Settings {
+            taker_enabled: true,
+            ..Settings::default()
+        });
+        assert!(taker_json(&plugin).contains("not open"));
+    }
+
+    #[test]
+    fn a_withdrawal_before_the_wallet_is_open_is_reported_not_attempted() {
+        let plugin = CoinswapPlugin::default();
+        let actions = plugin.withdraw(&std::collections::HashMap::from([
+            ("address".to_string(), "tb1qexample".to_string()),
+            ("sats".to_string(), "5000".to_string()),
+        ]));
+
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            PluginAction::ShowMessage {
+                level: MessageLevel::Error,
+                ..
+            }
+        )));
+        // Logged too, because a withdrawal is money moving.
+        assert!(actions
+            .iter()
+            .any(|action| matches!(action, PluginAction::Log { .. })));
+    }
+
+    #[test]
+    fn a_withdrawal_amount_that_is_not_a_number_is_refused_by_the_plugin() {
+        // The plugin should not depend on the host checking its input.
+        let plugin = CoinswapPlugin::default();
+        let actions = plugin.withdraw(&std::collections::HashMap::from([
+            ("address".to_string(), "tb1qexample".to_string()),
+            ("sats".to_string(), "half of it".to_string()),
+        ]));
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            PluginAction::ShowMessage { level: MessageLevel::Error, text }
+                if text.contains("whole number")
+        )));
+    }
+
+    #[test]
+    fn an_unknown_form_is_refused_rather_than_acted_on() {
+        let plugin = CoinswapPlugin::default();
+        let result = plugin.handle(HostEvent::FormSubmitted {
+            form_id: "not-a-form".to_string(),
+            values: std::collections::HashMap::new(),
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_settings_save_reports_on_both_roles() {
+        // A save that only changed the taker used to say nothing about the taker at all.
+        let plugin = CoinswapPlugin::default();
+        *lock(&plugin.settings) = Some(Settings {
+            tor_auth_password: "x".to_string(),
+            ..Settings::default()
+        });
+
+        let actions = plugin
+            .handle(HostEvent::SettingsUpdated {
+                values: std::collections::HashMap::new(),
+            })
+            .unwrap();
+
+        let messages = actions
+            .iter()
+            .filter(|action| matches!(action, PluginAction::ShowMessage { .. }))
+            .count();
+        assert_eq!(messages, 2, "one message per role");
     }
 }

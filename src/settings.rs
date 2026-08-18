@@ -11,6 +11,7 @@ use coinswap::{
     bitcoin::Network,
     bitcoind::bitcoincore_rpc::Auth,
     maker::MakerServerConfig,
+    taker::{api::ConnectionType, TakerInitConfig},
     wallet::{BackendConfig, CoreRpcConfig, ElectrumConfig},
 };
 
@@ -34,6 +35,29 @@ fn host_port(value: &str) -> String {
         .unwrap_or(value);
     // Anything after the host and port is a path, which coinswap appends itself.
     value.split('/').next().unwrap_or(value).trim().to_string()
+}
+
+/// How the taker reaches makers.
+#[derive(BtcpayChoice, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Reach {
+    /// Through the Tor SOCKS proxy. The only way to reach an onion address, which is what a
+    /// maker advertises, so this is the default.
+    #[default]
+    #[choice(value = "tor", label = "Tor")]
+    Tor,
+    /// Direct TCP. Cannot reach an onion address at all, so it is only useful against a maker
+    /// on a clearnet address, which in practice means a local test.
+    #[choice(value = "clearnet", label = "Clearnet (test only)")]
+    Clearnet,
+}
+
+impl Reach {
+    fn to_connection_type(self) -> ConnectionType {
+        match self {
+            Reach::Tor => ConnectionType::Tor,
+            Reach::Clearnet => ConnectionType::Clearnet,
+        }
+    }
 }
 
 /// Where the maker gets its chain data from.
@@ -77,10 +101,12 @@ impl Chain {
     }
 }
 
-/// Everything the operator configures.
+/// Everything the operator configures, for both roles.
 ///
-/// `enabled` defaults to false: a maker binds a port, locks funds into a bond and advertises
-/// itself, none of which should follow from clicking install.
+/// Chain source and Tor settings are shared; everything else is per role, including the wallet
+/// name -- coinswap keeps maker and taker wallets as separate files with separate seeds.
+///
+/// Both roles default to off: neither should start because somebody clicked install.
 #[derive(BtcpaySettings, Clone, Debug)]
 pub struct Settings {
     #[setting(
@@ -200,6 +226,33 @@ pub struct Settings {
                 months; the exact range is reported if this is out of bounds."
     )]
     pub fidelity_timelock: u32,
+
+    // --- Taker ---
+    /// Whether the taker's wallet should be open.
+    ///
+    /// Independent of the maker: an operator may want one, the other, or both.
+    #[setting(
+        label = "Enable the taker wallet",
+        help = "Opens a second wallet, separate from the maker's and from every BTCPay store \
+                wallet. It has its own recovery phrase."
+    )]
+    pub taker_enabled: bool,
+
+    /// Names the taker's wallet file under the plugin data directory.
+    #[setting(
+        label = "Taker wallet name",
+        help = "Must differ from the maker's wallet name: they are two wallets with two seeds.",
+        required
+    )]
+    pub taker_wallet_name: String,
+
+    /// How the taker reaches makers.
+    #[setting(
+        label = "Reach makers over",
+        help = "Makers advertise onion addresses, which only Tor can reach. Clearnet is for a \
+                local test against a maker that is not behind Tor."
+    )]
+    pub taker_reach: Reach,
 }
 
 impl Default for Settings {
@@ -228,6 +281,11 @@ impl Default for Settings {
             required_confirms: reference.required_confirms,
             fidelity_amount: reference.fidelity_amount as u32,
             fidelity_timelock: reference.fidelity_timelock,
+            taker_enabled: false,
+            // Distinct from the maker's default on purpose: one wallet name for two wallets
+            // would be an operator's worst afternoon.
+            taker_wallet_name: "btcpay-taker".to_string(),
+            taker_reach: Reach::Tor,
         }
     }
 }
@@ -271,6 +329,21 @@ impl Settings {
 
         if self.wallet_name.trim().is_empty() {
             return Err("Wallet name is required.".to_string());
+        }
+
+        if self.taker_enabled {
+            if self.taker_wallet_name.trim().is_empty() {
+                return Err("Taker wallet name is required.".to_string());
+            }
+            // Two coinswap wallets on one file, and one Bitcoin Core watch-only wallet driven by
+            // both, each treating the other's coins as its own. Refuse rather than discover it.
+            if self.taker_wallet_name.trim() == self.wallet_name.trim() {
+                return Err(
+                    "The taker wallet name must differ from the maker's. They are two separate \
+                     wallets, and sharing a name would point both at one file."
+                        .to_string(),
+                );
+            }
         }
 
         for (label, port) in [
@@ -318,6 +391,58 @@ impl Settings {
         Ok(())
     }
 
+    /// The chain source, in the shape coinswap wants.
+    ///
+    /// Shared by both roles rather than built twice: they talk to the same node, and two copies
+    /// of this would be two places for a change to be forgotten.
+    ///
+    /// `wallet_name` is a parameter and not `self.wallet_name` because the Core backend names a
+    /// **watch-only wallet inside Bitcoin Core**, and the two roles must not share one. If they
+    /// did, each would see the other's UTXOs as its own.
+    fn backend_config(&self, wallet_name: &str) -> BackendConfig {
+        match self.backend {
+            Backend::CoreRpc => BackendConfig::CoreRpc(CoreRpcConfig {
+                // Bare host:port, never a URL: coinswap adds the scheme and the wallet path.
+                url: host_port(&self.core_url),
+                auth: Auth::UserPass(self.core_user.clone(), self.core_password.clone()),
+                // The Core watch-only wallet this role drives, kept distinct from the other
+                // role's and from any store wallet BTCPay owns.
+                wallet_name: wallet_name.trim().to_string(),
+                zmq_addr: self.core_zmq_addr.trim().to_string(),
+            }),
+            Backend::Electrum => BackendConfig::Electrum(ElectrumConfig {
+                url: self.electrum_url.trim().to_string(),
+                socks5: Some(self.electrum_socks5.trim().to_string())
+                    .filter(|proxy| !proxy.is_empty()),
+                timeout: None,
+                poll_interval_secs: None,
+                max_retries: 3,
+            }),
+        }
+    }
+
+    /// Builds the config the taker's wallet opens with.
+    ///
+    /// Shares the chain source and the Tor settings with the maker, and nothing else: a separate
+    /// wallet name and a separate data directory, so the two wallets cannot touch each other.
+    pub fn to_taker_config(&self, data_dir: PathBuf) -> TakerInitConfig {
+        // `..default()` for the same reason the maker's config uses it: `nostr_relays` and
+        // anything coinswap adds later keep coinswap's own value rather than whatever zero
+        // happens to mean.
+        TakerInitConfig {
+            data_dir: Some(data_dir),
+            backend: self.backend_config(&self.taker_wallet_name),
+            wallet_name: self.taker_wallet_name.trim().to_string(),
+            // Range-checked in `check`, so these casts cannot truncate a port to zero.
+            control_port: Some(self.control_port as u16),
+            tor_auth_password: Some(self.tor_auth_password.clone()),
+            socks_port: self.socks_port as u16,
+            password: None,
+            connection_type: self.taker_reach.to_connection_type(),
+            ..TakerInitConfig::default()
+        }
+    }
+
     /// Builds the config the maker actually runs on.
     pub fn to_maker_config(&self, data_dir: PathBuf) -> MakerServerConfig {
         // The trailing `..default()` keeps coinswap's own value for fields not set here, and
@@ -342,24 +467,7 @@ impl Settings {
             fidelity_amount: u64::from(self.fidelity_amount),
             fidelity_timelock: self.fidelity_timelock,
 
-            backend: match self.backend {
-                Backend::CoreRpc => BackendConfig::CoreRpc(CoreRpcConfig {
-                    // Bare host:port, never a URL: coinswap adds the scheme and the wallet path.
-                    url: host_port(&self.core_url),
-                    auth: Auth::UserPass(self.core_user.clone(), self.core_password.clone()),
-                    // Kept distinct from any store wallet BTCPay owns.
-                    wallet_name: self.wallet_name.trim().to_string(),
-                    zmq_addr: self.core_zmq_addr.trim().to_string(),
-                }),
-                Backend::Electrum => BackendConfig::Electrum(ElectrumConfig {
-                    url: self.electrum_url.trim().to_string(),
-                    socks5: Some(self.electrum_socks5.trim().to_string())
-                        .filter(|proxy| !proxy.is_empty()),
-                    timeout: None,
-                    poll_interval_secs: None,
-                    max_retries: 3,
-                }),
-            },
+            backend: self.backend_config(&self.wallet_name),
 
             ..MakerServerConfig::default()
         }
@@ -609,5 +717,77 @@ mod tests {
         let default = Settings::default().core_url;
         assert!(!default.contains("://"), "default must not carry a scheme");
         assert_eq!(host_port(&default), default);
+    }
+
+    #[test]
+    fn the_two_wallets_may_not_share_a_name() {
+        // One name would mean one wallet file and one Core watch-only wallet driven by both
+        // roles, each seeing the other's coins as its own.
+        let settings = Settings {
+            taker_enabled: true,
+            wallet_name: "same".to_string(),
+            taker_wallet_name: "same".to_string(),
+            ..valid()
+        };
+        assert!(settings.check().unwrap_err().contains("must differ"));
+    }
+
+    #[test]
+    fn a_name_collision_is_ignored_while_the_taker_is_off() {
+        // Nothing opens the taker wallet, so there is nothing to collide with, and refusing here
+        // would block a maker-only operator over a field they never filled in.
+        let settings = Settings {
+            taker_enabled: false,
+            wallet_name: "same".to_string(),
+            taker_wallet_name: "same".to_string(),
+            ..valid()
+        };
+        assert!(settings.check().is_ok(), "{:?}", settings.check());
+    }
+
+    #[test]
+    fn the_defaults_give_the_two_roles_different_wallets() {
+        let defaults = Settings::default();
+        assert_ne!(defaults.wallet_name, defaults.taker_wallet_name);
+    }
+
+    #[test]
+    fn each_role_drives_its_own_core_watch_only_wallet() {
+        // Sharing one would give each role the other's UTXOs.
+        let settings = Settings {
+            taker_enabled: true,
+            ..valid()
+        };
+        let maker = match settings.to_maker_config(PathBuf::from("/tmp/m")).backend {
+            BackendConfig::CoreRpc(core) => core.wallet_name,
+            _ => panic!("expected a Core backend"),
+        };
+        let taker = match settings.to_taker_config(PathBuf::from("/tmp/t")).backend {
+            BackendConfig::CoreRpc(core) => core.wallet_name,
+            _ => panic!("expected a Core backend"),
+        };
+        assert_ne!(maker, taker);
+    }
+
+    #[test]
+    fn the_taker_gets_its_own_data_dir_and_the_shared_tor_settings() {
+        let settings = Settings {
+            taker_enabled: true,
+            ..valid()
+        };
+        let config = settings.to_taker_config(PathBuf::from("/var/lib/x/taker"));
+        assert_eq!(config.data_dir, Some(PathBuf::from("/var/lib/x/taker")));
+        assert_eq!(config.wallet_name, settings.taker_wallet_name);
+        assert_eq!(config.socks_port, settings.socks_port as u16);
+        assert_eq!(
+            config.tor_auth_password.as_deref(),
+            Some(settings.tor_auth_password.as_str())
+        );
+    }
+
+    #[test]
+    fn the_taker_reaches_makers_over_tor_by_default() {
+        // A maker advertises an onion address, which clearnet cannot reach at all.
+        assert_eq!(Settings::default().taker_reach, Reach::Tor);
     }
 }
