@@ -1,0 +1,31 @@
+[package]
+name = "coinswap-maker"
+version = "0.1.0"
+edition = "2021"
+description = "Run a coinswap maker inside BTCPay Server."
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+# Every btcpay-rs plugin builds under this name, not the crate's own. The generated C#
+# binds to it, which is what lets one set of bindings serve every plugin. Plugins stay
+# isolated: each loads in its own context, from its own directory.
+name = "btcpay_plugin_native"
+
+[dependencies]
+# Not published on crates.io yet, so a path dependency until it is.
+btcpay-plugin = { git = "https://github.com/uqlidi/btcpay-rs" }
+
+# Not published either. Cargo.lock pins the exact commit, so builds stay reproducible even
+# without a rev here.
+coinswap = { git = "https://github.com/citadel-tech/coinswap" }
+
+# Only to receive coinswap's own log records, not to emit any. See src/logging.rs.
+log = "0.4"
+
+[profile.release]
+lto = true
+# Must stay false. The binding generator reads metadata from the library's symbols and,
+# when stripped, exits successfully having produced nothing. Stripping happens at packaging
+# time instead, once the bindings exist.
+strip = false
