@@ -18,8 +18,9 @@
 //!
 //! - [`settings`] is what the operator fills in, and the one place it becomes a
 //!   `MakerServerConfig`.
-//! - [`runtime`] owns the maker's thread, because `start_server` blocks and `init` does chain
-//!   I/O that must not run on BTCPay's startup path.
+//! - [`maker`] owns the maker's thread, because `start_server` blocks and `init` does chain I/O
+//!   that must not run on BTCPay's startup path.
+//! - [`shared`] is what any role needs: the phase, the logger, the lock helper.
 //! - [`logging`] routes coinswap's own log output into BTCPay's, without which a failure inside
 //!   coinswap reports only whatever its error happened to carry.
 //! - This module is the glue: pages, commands, and reacting to a settings change.
@@ -28,17 +29,19 @@
 #![warn(clippy::all)]
 
 pub mod logging;
-pub mod runtime;
+pub mod maker;
 pub mod settings;
+pub mod shared;
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use btcpay_plugin::prelude::*;
 
-use runtime::{Logger, Phase, Runtime, Status};
+use maker::{MakerRuntime, Status};
 use settings::Settings;
+use shared::{lock, Logger, Phase};
 
 /// How long a drain command waits for an idle swap to wind up.
 ///
@@ -55,20 +58,12 @@ const STOP_DEADLINE: Duration = Duration::from_secs(30);
 /// The plugin.
 #[derive(Default)]
 pub struct CoinswapPlugin {
-    runtime: Runtime,
+    maker: MakerRuntime,
     /// Settings as last loaded or saved, so rendering a page does not re-read storage field by
     /// field across the FFI boundary.
     settings: Mutex<Option<Settings>>,
     /// Kept from `start` so a command can log and find the data directory.
     host: Mutex<Option<Arc<dyn HostServices>>>,
-}
-
-/// Recovers a poisoned lock rather than propagating the panic, for the reason given in
-/// [`runtime`]: a panic here must not make shutdown impossible.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl CoinswapPlugin {
@@ -111,8 +106,8 @@ impl CoinswapPlugin {
         let logger = Self::logger(Arc::clone(&host));
 
         if !settings.enabled {
-            if self.runtime.is_live() {
-                return Ok(if self.runtime.stop(STOP_DEADLINE, &logger) {
+            if self.maker.is_live() {
+                return Ok(if self.maker.stop(STOP_DEADLINE, &logger) {
                     "Maker stopped.".to_string()
                 } else {
                     "Maker was asked to stop but did not finish in time.".to_string()
@@ -125,8 +120,8 @@ impl CoinswapPlugin {
 
         // Restart rather than reconfigure. `init` consumes the config and the running server
         // owns it, so there is no way to change a fee or a port underneath a live maker.
-        if self.runtime.is_live() {
-            self.runtime.stop(STOP_DEADLINE, &logger);
+        if self.maker.is_live() {
+            self.maker.stop(STOP_DEADLINE, &logger);
         }
 
         let dir = Self::maker_dir(host.as_ref());
@@ -137,7 +132,7 @@ impl CoinswapPlugin {
             )
         })?;
 
-        self.runtime.start(settings.to_maker_config(dir), logger)?;
+        self.maker.start(settings.to_maker_config(dir), logger)?;
 
         Ok("Maker is starting. Reload the dashboard to see it come up.".to_string())
     }
@@ -145,13 +140,13 @@ impl CoinswapPlugin {
     /// Builds the dashboard.
     fn dashboard(&self) -> Document {
         let settings = self.settings();
-        let status = self.runtime.status();
+        let status = self.maker.status();
 
         let mut page = Document::new("Coinswap maker");
 
         // A new wallet's phrase, first and once. An operator who misses it cannot recover the
         // wallet, so it outranks everything else on the page.
-        if let Some(words) = self.runtime.take_new_mnemonic() {
+        if let Some(words) = self.maker.take_new_mnemonic() {
             page = page
                 .alert(
                     AlertLevel::Warning,
@@ -233,7 +228,7 @@ impl CoinswapPlugin {
     fn commands(&self, status: &Status, settings: &Settings) -> Actions {
         let mut actions = Actions::new().title("Operations");
 
-        if self.runtime.is_live() {
+        if self.maker.is_live() {
             actions = actions.button(Button::new("stop", "Stop the maker").destructive(
                 if status.ongoing_swaps == Some(true) {
                     "A swap is in progress. Stopping now risks it timing out and falling back to \
@@ -254,7 +249,7 @@ impl CoinswapPlugin {
         // Offered whenever the wallet is open, which includes a maker that failed to start. That
         // is the case that matters: the maker cannot start without a funded wallet, so refusing
         // to hand out an address until it is running would be a deadlock.
-        if self.runtime.wallet_open() {
+        if self.maker.wallet_open() {
             actions = actions.button(Button::new("address", "Show a funding address"));
         }
 
@@ -347,7 +342,7 @@ impl CoinswapPlugin {
             // "enabled" ought to mean.
             "stop" => match self.host() {
                 Some(host) => {
-                    if self.runtime.stop(STOP_DEADLINE, &Self::logger(host)) {
+                    if self.maker.stop(STOP_DEADLINE, &Self::logger(host)) {
                         Ok("Maker stopped.".to_string())
                     } else {
                         Err(format!(
@@ -359,13 +354,13 @@ impl CoinswapPlugin {
                 }
                 None => Err("The plugin has not finished starting yet.".to_string()),
             },
-            "address" => self.runtime.receive_address().map(|address| {
+            "address" => self.maker.receive_address().map(|address| {
                 format!(
                     "Send funds to {address} -- this is the maker's own wallet, not a store \
                      wallet. The address advances each time, so take a fresh one per deposit."
                 )
             }),
-            "drain" => self.runtime.drain_idle_swaps(DRAIN_TIMEOUT).map(|count| {
+            "drain" => self.maker.drain_idle_swaps(DRAIN_TIMEOUT).map(|count| {
                 if count == 0 {
                     "No idle swaps needed draining.".to_string()
                 } else {
@@ -429,7 +424,7 @@ impl Plugin for CoinswapPlugin {
 
     fn stop(&self) {
         let logger = self.host().map_or_else(Logger::silent, Self::logger);
-        self.runtime.stop(STOP_DEADLINE, &logger);
+        self.maker.stop(STOP_DEADLINE, &logger);
         // After the stop, so anything coinswap logs on its way down is still delivered.
         logging::detach();
     }

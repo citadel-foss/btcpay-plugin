@@ -15,26 +15,16 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use crate::shared::{
+    describe, lock, sleep_unless_stopped, Logger, Phase, SendOnDrop, RETRY_BACKOFF, START_ATTEMPTS,
+};
 use coinswap::maker::{start_server, MakerServer, MakerServerConfig};
 use coinswap::utill::check_tor_status;
 use coinswap::wallet::{AddressType, Balances};
-
-/// What the maker is doing, as far as the dashboard is concerned.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Phase {
-    /// Not running, and not asked to.
-    Stopped,
-    /// Connecting to the backend and opening the wallet.
-    Starting,
-    /// Serving takers.
-    Running,
-    /// It tried and could not. The string is for the operator, not for a machine.
-    Failed(String),
-}
 
 /// State both the maker thread and the plugin touch.
 ///
@@ -63,60 +53,12 @@ struct Control {
 }
 
 /// Starts and stops the maker, and answers questions about it.
-pub struct Runtime {
+pub struct MakerRuntime {
     shared: Arc<Mutex<Shared>>,
     control: Mutex<Option<Control>>,
 }
 
-/// How many times to check that Tor is usable before giving up on it.
-///
-/// Small on purpose. This covers a Tor that is seconds away from being ready, not a
-/// misconfiguration: a wrong control password fails this many times in a row and is then
-/// reported, which is the right outcome for something no amount of waiting will fix.
-const START_ATTEMPTS: u32 = 4;
-
-/// Multiplied by the attempt number, so waits go 5s, 10s, 15s.
-const RETRY_BACKOFF: Duration = Duration::from_secs(5);
-
-/// Waits `total`, returning true if a stop was requested before it elapsed.
-///
-/// Polled rather than parked on a condvar because the flag it watches is shared with `stop`,
-/// which cannot be given a waker without threading one through every caller.
-fn sleep_unless_stopped(total: Duration, stop_requested: &AtomicBool) -> bool {
-    const TICK: Duration = Duration::from_millis(200);
-    let mut slept = Duration::ZERO;
-    while slept < total {
-        if stop_requested.load(Ordering::Relaxed) {
-            return true;
-        }
-        let step = TICK.min(total - slept);
-        std::thread::sleep(step);
-        slept += step;
-    }
-    stop_requested.load(Ordering::Relaxed)
-}
-
-/// Turns a coinswap error into something an operator can read.
-///
-/// `MakerError` implements `Debug` but not `Display`, so the debug form is the only text
-/// available. It is not prose, but it names the variant and carries the underlying cause, which
-/// is what an operator needs in order to act. Kept in one place so that a `Display` impl
-/// appearing upstream is a one-line change here.
-fn describe(error: impl std::fmt::Debug) -> String {
-    format!("{error:?}")
-}
-
-/// Recovers a poisoned lock rather than propagating the panic.
-///
-/// A panic while holding one of these locks would otherwise make every later call fail,
-/// including `stop`, leaving a maker running that nothing could shut down.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-impl Runtime {
+impl MakerRuntime {
     /// A runtime with no maker running.
     pub fn new() -> Self {
         Self {
@@ -470,7 +412,7 @@ impl Runtime {
     }
 }
 
-impl Default for Runtime {
+impl Default for MakerRuntime {
     fn default() -> Self {
         Self::new()
     }
@@ -511,52 +453,13 @@ impl Status {
     }
 }
 
-/// Signals on drop, so a panicking thread still reports that it is done.
-struct SendOnDrop(mpsc::Sender<()>);
-
-impl Drop for SendOnDrop {
-    fn drop(&mut self) {
-        let _ = self.0.send(());
-    }
-}
-
-/// Logging the runtime can do without knowing about the host.
-///
-/// The maker thread outlives the call that spawned it, so it cannot borrow a `HostServices`, and
-/// the runtime is exercised in tests that have none.
-#[derive(Clone)]
-pub struct Logger(Arc<LogSink>);
-
-/// The callable a [`Logger`] wraps: (is_error, message).
-type LogSink = dyn Fn(bool, &str) + Send + Sync;
-
-impl Logger {
-    /// Wraps a sink taking (is_error, message).
-    pub fn new(sink: impl Fn(bool, &str) + Send + Sync + 'static) -> Self {
-        Self(Arc::new(sink))
-    }
-
-    /// Discards everything. For tests.
-    pub fn silent() -> Self {
-        Self::new(|_, _| {})
-    }
-
-    fn info(&self, message: &str) {
-        (self.0)(false, message)
-    }
-
-    fn error(&self, message: &str) {
-        (self.0)(true, message)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn a_new_runtime_is_stopped_and_has_no_seed_phrase() {
-        let runtime = Runtime::new();
+        let runtime = MakerRuntime::new();
         assert_eq!(runtime.phase(), Phase::Stopped);
         assert!(!runtime.is_live());
         assert!(runtime.take_new_mnemonic().is_none());
@@ -565,13 +468,13 @@ mod tests {
     #[test]
     fn stopping_a_runtime_that_never_started_succeeds() {
         // `stop` runs on BTCPay's shutdown path, where throwing is not an option.
-        let runtime = Runtime::new();
+        let runtime = MakerRuntime::new();
         assert!(runtime.stop(Duration::from_secs(1), &Logger::silent()));
     }
 
     #[test]
     fn stopping_twice_succeeds() {
-        let runtime = Runtime::new();
+        let runtime = MakerRuntime::new();
         assert!(runtime.stop(Duration::from_secs(1), &Logger::silent()));
         assert!(runtime.stop(Duration::from_secs(1), &Logger::silent()));
     }
@@ -580,14 +483,14 @@ mod tests {
     fn commands_report_that_the_wallet_is_shut_rather_than_panicking() {
         // An operator can reach the dashboard while the maker is stopped, so every command has
         // to survive being pressed then.
-        let runtime = Runtime::new();
+        let runtime = MakerRuntime::new();
         assert!(runtime.receive_address().is_err());
         assert!(runtime.drain_idle_swaps(Duration::from_secs(1)).is_err());
     }
 
     #[test]
     fn a_status_without_a_maker_still_renders() {
-        let runtime = Runtime::new();
+        let runtime = MakerRuntime::new();
         let status = runtime.status();
         assert_eq!(status.phase, Phase::Stopped);
         assert!(status.balances.is_none());
@@ -597,7 +500,7 @@ mod tests {
 
     #[test]
     fn a_seed_phrase_is_handed_out_once() {
-        let runtime = Runtime::new();
+        let runtime = MakerRuntime::new();
         lock(&runtime.shared).new_mnemonic = Some("abandon abandon about".to_string());
 
         assert!(runtime.take_new_mnemonic().is_some());
@@ -611,7 +514,7 @@ mod tests {
     fn a_poisoned_lock_does_not_wedge_the_runtime() {
         // If a panic while holding the lock made every later call fail, `stop` would fail too
         // and a running maker would become unstoppable.
-        let runtime = Runtime::new();
+        let runtime = MakerRuntime::new();
         let shared = Arc::clone(&runtime.shared);
         let _ = std::thread::spawn(move || {
             let _guard = shared.lock().unwrap();
@@ -627,7 +530,7 @@ mod tests {
     fn a_failure_survives_a_later_stop() {
         // The dashboard has to keep explaining why the maker went away; overwriting the reason
         // with a bare "stopped" is how an operator loses the only clue they had.
-        let runtime = Runtime::new();
+        let runtime = MakerRuntime::new();
         lock(&runtime.shared).phase = Phase::Failed("backend unreachable".to_string());
 
         runtime.stop(Duration::from_secs(1), &Logger::silent());
@@ -644,7 +547,7 @@ mod tests {
         // second one onto the same port would fail confusingly, so `start` must refuse until the
         // first is genuinely gone. Simulated by a `finished` channel whose sender is still alive,
         // which is exactly the state a wedged thread leaves behind.
-        let runtime = Runtime::new();
+        let runtime = MakerRuntime::new();
         let (keep_alive, finished) = mpsc::channel();
         lock(&runtime.shared).phase = Phase::Running;
         *lock(&runtime.control) = Some(Control {
@@ -671,7 +574,7 @@ mod tests {
     #[test]
     fn a_start_is_refused_while_one_is_already_starting() {
         // Two makers on one port, one of which would fail to bind and report a confusing error.
-        let runtime = Runtime::new();
+        let runtime = MakerRuntime::new();
         lock(&runtime.shared).phase = Phase::Starting;
 
         assert!(runtime
