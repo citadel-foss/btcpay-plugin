@@ -326,6 +326,42 @@ impl CoinswapPlugin {
 
         page = page.stats(stats);
 
+        // Swaps first when any still has money on chain: funds sit in a contract until a
+        // timelock releases them, and nothing else on this page would say so.
+        let at_stake: Vec<_> = status
+            .swaps
+            .iter()
+            .filter(|swap| swap.funds_at_stake())
+            .collect();
+        if !at_stake.is_empty() {
+            let total: u64 = at_stake.iter().map(|swap| swap.amount_sat).sum();
+            page = page.alert(
+                AlertLevel::Warning,
+                format!(
+                    "{} swap(s) did not finish, with {} still in contracts on chain. The maker \
+                     recovers these itself once the timelock allows it, which can take a while. \
+                     Leave it running: stopping it now delays recovery.",
+                    at_stake.len(),
+                    Self::sats(total)
+                ),
+            );
+        }
+
+        if !status.swaps.is_empty() {
+            let mut swaps = Table::new(["Swap", "Amount", "Phase", "Recovery", "On chain"])
+                .title("Unfinished swaps");
+            for swap in &status.swaps {
+                swaps = swaps.row([
+                    swap.id.clone(),
+                    Self::sats(swap.amount_sat),
+                    swap.phase.clone(),
+                    swap.recovery.clone(),
+                    if swap.funded { "yes" } else { "no" }.to_string(),
+                ]);
+            }
+            page = page.table(swaps);
+        }
+
         let mut bonds = Table::new(["Amount", "Locked until"])
             .title("Fidelity bonds")
             .empty_message(
