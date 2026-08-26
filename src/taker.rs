@@ -488,6 +488,17 @@ impl TakerRuntime {
         }
     }
 
+    /// Whether an earlier swap is still being recovered.
+    ///
+    /// `None` when undetermined, which callers treat as "do not block": refusing on a reading
+    /// we could not take would strand the operator. coinswap drives the recovery itself; this
+    /// only reads it.
+    pub fn recovery_pending(&self) -> Option<bool> {
+        let handle = lock(&self.shared).taker.clone()?;
+        let taker = handle.try_lock().ok()?;
+        Some(!taker.is_recovery_complete())
+    }
+
     /// True while a swap is executing, so callers can refuse to start another.
     pub fn swap_running(&self) -> bool {
         matches!(lock(&self.shared).swap, SwapState::Running { .. })
@@ -502,6 +513,16 @@ impl TakerRuntime {
         let Some(handle) = handle else {
             return Err("The taker wallet is not open.".to_string());
         };
+
+        // Contracts still recovering means funds are committed elsewhere; starting another is
+        // how one bad swap becomes two.
+        if self.recovery_pending() == Some(true) {
+            return Err(
+                "An earlier swap is still being recovered. Wait for its contracts to resolve \
+                 before starting another."
+                    .to_string(),
+            );
+        }
 
         let swap_id = {
             let mut shared = lock(&self.shared);
@@ -848,5 +869,20 @@ mod tests {
 
         assert!(runtime.clear_swap().is_ok());
         assert!(matches!(runtime.swap_state(), SwapState::Idle));
+    }
+
+    #[test]
+    fn recovery_state_is_unknown_without_a_wallet() {
+        // Unknown must not read as "pending", or a shut taker looks like it has contracts out.
+        assert_eq!(TakerRuntime::new().recovery_pending(), None);
+    }
+
+    #[test]
+    fn an_unknown_recovery_state_does_not_block_a_swap() {
+        // Compares against `Some(true)` so an unavailable reading does not strand the operator;
+        // here it falls through to the missing-quote error.
+        let runtime = TakerRuntime::new();
+        let err = runtime.accept_quote(Logger::silent()).unwrap_err();
+        assert!(!err.contains("still being recovered"), "{err}");
     }
 }
