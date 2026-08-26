@@ -50,6 +50,36 @@ pub enum QuoteState {
     Failed(String),
 }
 
+/// How a finished swap turned out.
+pub struct SwapOutcome {
+    pub swap_id: String,
+    pub status: String,
+    pub sent_sat: u64,
+    pub received_sat: u64,
+    pub maker_fees_sat: u64,
+    pub mining_fee_sat: u64,
+    pub duration_secs: f64,
+}
+
+/// Where an accepted swap has got to.
+///
+/// Separate from [`QuoteState`]: a quote can be thrown away, a running swap has funds in
+/// contracts.
+pub enum SwapState {
+    Idle,
+    /// Funds are committed on chain from here on.
+    Running {
+        swap_id: String,
+        since: std::time::Instant,
+    },
+    Done(SwapOutcome),
+    /// Funds may be in contracts awaiting recovery.
+    Failed {
+        swap_id: String,
+        why: String,
+    },
+}
+
 /// The taker, and the thread that opened it.
 ///
 /// A `Mutex` rather than an `RwLock`: the operations that matter take `&mut self`. Reading the
@@ -63,6 +93,8 @@ struct Shared {
     new_mnemonic: Option<String>,
     /// The most recent quote, or how it is going.
     quote: QuoteState,
+    /// The accepted swap, or how it went.
+    swap: SwapState,
 }
 
 /// Thread bookkeeping, touched only by `start` and `stop`.
@@ -111,6 +143,7 @@ impl TakerRuntime {
                 taker: None,
                 new_mnemonic: None,
                 quote: QuoteState::Idle,
+                swap: SwapState::Idle,
             })),
             control: Mutex::new(None),
         }
@@ -347,18 +380,26 @@ impl TakerRuntime {
             return Err("A swap needs at least one maker.".to_string());
         }
 
+        // In-memory guards first, so the message names the most specific reason. Without this
+        // the quote thread blocks on the taker and fires hours later against a stale offerbook.
+        {
+            let shared = lock(&self.shared);
+            if matches!(shared.quote, QuoteState::Preparing) {
+                return Err("A quote is already being prepared.".to_string());
+            }
+            if matches!(shared.swap, SwapState::Running { .. }) {
+                return Err(
+                    "A swap is running. Wait for it to finish before quoting another.".to_string(),
+                );
+            }
+        }
+
         let handle = lock(&self.shared).taker.clone();
         let Some(handle) = handle else {
             return Err("The taker wallet is not open.".to_string());
         };
 
-        {
-            let mut shared = lock(&self.shared);
-            if matches!(shared.quote, QuoteState::Preparing) {
-                return Err("A quote is already being prepared.".to_string());
-            }
-            shared.quote = QuoteState::Preparing;
-        }
+        lock(&self.shared).quote = QuoteState::Preparing;
 
         let shared = Arc::clone(&self.shared);
         std::thread::Builder::new()
@@ -419,6 +460,126 @@ impl TakerRuntime {
                 format!("Could not spawn the quote thread: {error}")
             })?;
 
+        Ok(())
+    }
+
+    /// Reports where an accepted swap has got to, for the page.
+    pub fn swap_state(&self) -> SwapState {
+        let shared = lock(&self.shared);
+        match &shared.swap {
+            SwapState::Idle => SwapState::Idle,
+            SwapState::Running { swap_id, since } => SwapState::Running {
+                swap_id: swap_id.clone(),
+                since: *since,
+            },
+            SwapState::Failed { swap_id, why } => SwapState::Failed {
+                swap_id: swap_id.clone(),
+                why: why.clone(),
+            },
+            SwapState::Done(outcome) => SwapState::Done(SwapOutcome {
+                swap_id: outcome.swap_id.clone(),
+                status: outcome.status.clone(),
+                sent_sat: outcome.sent_sat,
+                received_sat: outcome.received_sat,
+                maker_fees_sat: outcome.maker_fees_sat,
+                mining_fee_sat: outcome.mining_fee_sat,
+                duration_secs: outcome.duration_secs,
+            }),
+        }
+    }
+
+    /// True while a swap is executing, so callers can refuse to start another.
+    pub fn swap_running(&self) -> bool {
+        matches!(lock(&self.shared).swap, SwapState::Running { .. })
+    }
+
+    /// Executes the prepared quote. **This commits funds on chain.**
+    ///
+    /// The quote is consumed, so it cannot be accepted twice. Holds the taker for the whole
+    /// swap, so everything else uses `try_lock` and reports busy.
+    pub fn accept_quote(&self, log: Logger) -> Result<String, String> {
+        let handle = lock(&self.shared).taker.clone();
+        let Some(handle) = handle else {
+            return Err("The taker wallet is not open.".to_string());
+        };
+
+        let swap_id = {
+            let mut shared = lock(&self.shared);
+
+            if matches!(shared.swap, SwapState::Running { .. }) {
+                return Err("A swap is already running.".to_string());
+            }
+            let QuoteState::Ready(quote) = &shared.quote else {
+                return Err("There is no quote to accept. Request one first.".to_string());
+            };
+            let swap_id = quote.swap_id.clone();
+
+            shared.quote = QuoteState::Idle;
+            shared.swap = SwapState::Running {
+                swap_id: swap_id.clone(),
+                since: std::time::Instant::now(),
+            };
+            swap_id
+        };
+
+        let shared = Arc::clone(&self.shared);
+        let started = swap_id.clone();
+        std::thread::Builder::new()
+            .name("coinswap-swap".to_string())
+            .spawn(move || {
+                log.info(&format!(
+                    "Starting swap {started}. Funds are committed on chain from here; leave \
+                     BTCPay running until it finishes."
+                ));
+
+                let outcome = match handle.lock() {
+                    Ok(mut taker) => taker.start_coinswap(&started).map_err(describe),
+                    Err(_) => Err("The taker is locked by a failed operation.".to_string()),
+                };
+
+                let mut shared = lock(&shared);
+                shared.swap = match outcome {
+                    Ok(report) => {
+                        log.info(&format!(
+                            "Swap {} finished: {:?}, {} sats in maker fees.",
+                            report.swap_id, report.status, report.total_maker_fees
+                        ));
+                        SwapState::Done(SwapOutcome {
+                            swap_id: report.swap_id,
+                            status: format!("{:?}", report.status),
+                            sent_sat: report.outgoing_amount,
+                            received_sat: report.incoming_amount,
+                            maker_fees_sat: report.total_maker_fees,
+                            mining_fee_sat: report.mining_fee,
+                            duration_secs: report.swap_duration_seconds,
+                        })
+                    }
+                    Err(why) => {
+                        log.error(&format!("Swap {started} did not finish: {why}"));
+                        SwapState::Failed {
+                            swap_id: started,
+                            why,
+                        }
+                    }
+                };
+            })
+            .map_err(|error| {
+                lock(&self.shared).swap = SwapState::Idle;
+                format!("Could not spawn the swap thread: {error}")
+            })?;
+
+        Ok(swap_id)
+    }
+
+    /// Clears a finished or failed swap, so the page offers a new quote.
+    ///
+    /// Refuses while one is running: the state is the only record that funds are committed.
+    pub fn clear_swap(&self) -> Result<(), String> {
+        let mut shared = lock(&self.shared);
+        if matches!(shared.swap, SwapState::Running { .. }) {
+            return Err("That swap is still running.".to_string());
+        }
+        shared.swap = SwapState::Idle;
         Ok(())
     }
 
@@ -628,5 +789,64 @@ mod tests {
         // matters, covered by the state staying Preparing.
         assert!(!err.is_empty());
         assert!(matches!(runtime.quote_state(), QuoteState::Preparing));
+    }
+
+    #[test]
+    fn a_swap_cannot_be_accepted_without_a_quote() {
+        let runtime = TakerRuntime::new();
+        assert!(runtime.accept_quote(Logger::silent()).is_err());
+    }
+
+    #[test]
+    fn a_second_swap_is_refused_while_one_is_running() {
+        // The state is the only record that funds are committed, so it must not be trampled.
+        let runtime = TakerRuntime::new();
+        lock(&runtime.shared).swap = SwapState::Running {
+            swap_id: "abc".to_string(),
+            since: std::time::Instant::now(),
+        };
+
+        assert!(runtime.accept_quote(Logger::silent()).is_err());
+        assert!(runtime.swap_running());
+    }
+
+    #[test]
+    fn a_quote_is_refused_while_a_swap_is_running() {
+        // Otherwise the quote thread blocks for the whole swap and fires against a stale
+        // offerbook.
+        let runtime = TakerRuntime::new();
+        lock(&runtime.shared).swap = SwapState::Running {
+            swap_id: "abc".to_string(),
+            since: std::time::Instant::now(),
+        };
+
+        let err = runtime
+            .request_quote(100_000, 2, Logger::silent())
+            .unwrap_err();
+        assert!(err.contains("swap is running"), "{err}");
+    }
+
+    #[test]
+    fn a_running_swap_cannot_be_cleared() {
+        let runtime = TakerRuntime::new();
+        lock(&runtime.shared).swap = SwapState::Running {
+            swap_id: "abc".to_string(),
+            since: std::time::Instant::now(),
+        };
+
+        assert!(runtime.clear_swap().is_err());
+        assert!(runtime.swap_running());
+    }
+
+    #[test]
+    fn a_failed_swap_can_be_cleared() {
+        let runtime = TakerRuntime::new();
+        lock(&runtime.shared).swap = SwapState::Failed {
+            swap_id: "abc".to_string(),
+            why: "the makers went away".to_string(),
+        };
+
+        assert!(runtime.clear_swap().is_ok());
+        assert!(matches!(runtime.swap_state(), SwapState::Idle));
     }
 }
