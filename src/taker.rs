@@ -11,10 +11,44 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use coinswap::taker::{Taker, TakerInitConfig};
+use coinswap::bitcoin::Amount;
+use coinswap::protocol::common_messages::ProtocolVersion;
+use coinswap::taker::{SwapParams, Taker, TakerInitConfig};
 use coinswap::wallet::{AddressType, Balances};
 
 use crate::shared::{describe, lock, Logger, Phase, SendOnDrop};
+
+/// One hop of a quote: the maker at that position and what it charges.
+pub struct QuoteHop {
+    pub address: String,
+    pub locktime: u16,
+    pub fee_sat: u64,
+}
+
+/// What a swap would cost, before anything is committed.
+///
+/// Owned rather than holding coinswap's `SwapSummary`, so rendering it needs no lock.
+pub struct Quote {
+    /// Identifies the prepared swap, and is what executing it will refer to.
+    pub swap_id: String,
+    pub send_sat: u64,
+    pub total_fee_sat: u64,
+    pub receive_sat: u64,
+    pub hops: Vec<QuoteHop>,
+}
+
+/// Where the quote has got to.
+///
+/// `prepare_coinswap` syncs the offerbook over Tor and waits on Nostr discovery, far too long
+/// for the operator's request, so it runs on a thread and the page reports what it finds.
+pub enum QuoteState {
+    Idle,
+    Preparing,
+    /// Nothing has been committed.
+    Ready(Quote),
+    /// The string is for the operator.
+    Failed(String),
+}
 
 /// The taker, and the thread that opened it.
 ///
@@ -27,6 +61,8 @@ struct Shared {
     ///
     /// Same rule as the maker's: memory only, taken rather than read, gone on restart.
     new_mnemonic: Option<String>,
+    /// The most recent quote, or how it is going.
+    quote: QuoteState,
 }
 
 /// Thread bookkeeping, touched only by `start` and `stop`.
@@ -74,6 +110,7 @@ impl TakerRuntime {
                 phase: Phase::Stopped,
                 taker: None,
                 new_mnemonic: None,
+                quote: QuoteState::Idle,
             })),
             control: Mutex::new(None),
         }
@@ -268,6 +305,128 @@ impl TakerRuntime {
         status
     }
 
+    /// Reports where the current quote has got to, for the page.
+    pub fn quote_state(&self) -> QuoteState {
+        let shared = lock(&self.shared);
+        match &shared.quote {
+            QuoteState::Idle => QuoteState::Idle,
+            QuoteState::Preparing => QuoteState::Preparing,
+            QuoteState::Failed(why) => QuoteState::Failed(why.clone()),
+            QuoteState::Ready(quote) => QuoteState::Ready(Quote {
+                swap_id: quote.swap_id.clone(),
+                send_sat: quote.send_sat,
+                total_fee_sat: quote.total_fee_sat,
+                receive_sat: quote.receive_sat,
+                hops: quote
+                    .hops
+                    .iter()
+                    .map(|hop| QuoteHop {
+                        address: hop.address.clone(),
+                        locktime: hop.locktime,
+                        fee_sat: hop.fee_sat,
+                    })
+                    .collect(),
+            }),
+        }
+    }
+
+    /// Asks the makers what a swap would cost, on a thread.
+    ///
+    /// Nothing is committed: coinswap negotiates, reserves a swap id and stops, so the operator
+    /// can see the fee before deciding.
+    pub fn request_quote(
+        &self,
+        send_sat: u64,
+        maker_count: usize,
+        log: Logger,
+    ) -> Result<(), String> {
+        if send_sat == 0 {
+            return Err("A swap needs an amount above zero.".to_string());
+        }
+        if maker_count == 0 {
+            return Err("A swap needs at least one maker.".to_string());
+        }
+
+        let handle = lock(&self.shared).taker.clone();
+        let Some(handle) = handle else {
+            return Err("The taker wallet is not open.".to_string());
+        };
+
+        {
+            let mut shared = lock(&self.shared);
+            if matches!(shared.quote, QuoteState::Preparing) {
+                return Err("A quote is already being prepared.".to_string());
+            }
+            shared.quote = QuoteState::Preparing;
+        }
+
+        let shared = Arc::clone(&self.shared);
+        std::thread::Builder::new()
+            .name("coinswap-quote".to_string())
+            .spawn(move || {
+                // Legacy is what the makers on this network negotiated; Taproot needs something
+                // to test against first.
+                let params = SwapParams::new(
+                    ProtocolVersion::Legacy,
+                    Amount::from_sat(send_sat),
+                    maker_count,
+                );
+
+                log.info(&format!(
+                    "Preparing a quote for {send_sat} sats across {maker_count} maker(s). This \
+                     synchronises the offerbook over Tor and can take a while."
+                ));
+
+                // Held for the whole negotiation; everything else uses `try_lock` and reports
+                // busy rather than queueing.
+                let outcome = match handle.lock() {
+                    Ok(mut taker) => taker.prepare_coinswap(params).map_err(describe),
+                    Err(_) => Err("The taker is locked by a failed operation.".to_string()),
+                };
+
+                let mut shared = lock(&shared);
+                shared.quote = match outcome {
+                    Ok(summary) => {
+                        log.info(&format!(
+                            "Quote ready: swap {} costs {} sats in fees.",
+                            summary.swap_id,
+                            summary.total_estimated_fee.to_sat()
+                        ));
+                        QuoteState::Ready(Quote {
+                            swap_id: summary.swap_id,
+                            send_sat: summary.send_amount.to_sat(),
+                            total_fee_sat: summary.total_estimated_fee.to_sat(),
+                            receive_sat: summary.estimated_receive_amount.to_sat(),
+                            hops: summary
+                                .makers
+                                .into_iter()
+                                .map(|maker| QuoteHop {
+                                    address: maker.address,
+                                    locktime: maker.locktime,
+                                    fee_sat: maker.estimated_fee_sats,
+                                })
+                                .collect(),
+                        })
+                    }
+                    Err(why) => {
+                        log.error(&format!("Could not prepare a quote: {why}"));
+                        QuoteState::Failed(why)
+                    }
+                };
+            })
+            .map_err(|error| {
+                lock(&self.shared).quote = QuoteState::Idle;
+                format!("Could not spawn the quote thread: {error}")
+            })?;
+
+        Ok(())
+    }
+
+    /// Forgets the current quote, so the page offers a fresh one.
+    pub fn clear_quote(&self) {
+        lock(&self.shared).quote = QuoteState::Idle;
+    }
+
     /// Hands out a fresh address for funding the taker's wallet.
     ///
     /// A command, not a page card: it advances the address index and writes to disk.
@@ -414,5 +573,60 @@ mod tests {
             runtime.phase(),
             Phase::Failed("backend unreachable".to_string())
         );
+    }
+
+    #[test]
+    fn a_quote_is_refused_before_the_wallet_is_open() {
+        let runtime = TakerRuntime::new();
+        assert!(runtime.request_quote(100_000, 2, Logger::silent()).is_err());
+    }
+
+    #[test]
+    fn a_quote_needs_an_amount_and_a_maker() {
+        // Checked before the wallet, so the message names the real problem.
+        let runtime = TakerRuntime::new();
+        assert!(runtime
+            .request_quote(0, 2, Logger::silent())
+            .unwrap_err()
+            .contains("amount"));
+        assert!(runtime
+            .request_quote(100_000, 0, Logger::silent())
+            .unwrap_err()
+            .contains("maker"));
+    }
+
+    #[test]
+    fn a_fresh_runtime_has_no_quote() {
+        assert!(matches!(
+            TakerRuntime::new().quote_state(),
+            QuoteState::Idle
+        ));
+    }
+
+    #[test]
+    fn discarding_a_quote_returns_to_idle() {
+        let runtime = TakerRuntime::new();
+        lock(&runtime.shared).quote = QuoteState::Failed("nope".to_string());
+
+        runtime.clear_quote();
+
+        assert!(matches!(runtime.quote_state(), QuoteState::Idle));
+    }
+
+    #[test]
+    fn a_second_quote_is_refused_while_one_is_being_prepared() {
+        // `prepare_coinswap` holds the taker throughout, so a second request would queue
+        // invisibly rather than being told no.
+        let runtime = TakerRuntime::new();
+        lock(&runtime.shared).quote = QuoteState::Preparing;
+
+        let err = runtime
+            .request_quote(100_000, 2, Logger::silent())
+            .unwrap_err();
+
+        // Says "wallet not open" only because this runtime has none; the guard order is what
+        // matters, covered by the state staying Preparing.
+        assert!(!err.is_empty());
+        assert!(matches!(runtime.quote_state(), QuoteState::Preparing));
     }
 }

@@ -34,7 +34,7 @@ use btcpay_plugin::prelude::*;
 use maker::{MakerRuntime, Status};
 use settings::Settings;
 use shared::{lock, Logger, Phase};
-use taker::TakerRuntime;
+use taker::{QuoteState, TakerRuntime};
 
 /// How long a drain command waits for an idle swap to wind up.
 ///
@@ -202,6 +202,58 @@ impl CoinswapPlugin {
 
         page = page.stats(stats);
 
+        // The quote, above the wallet: it is what the operator is waiting on.
+        match self.taker.quote_state() {
+            QuoteState::Idle => {}
+            QuoteState::Preparing => {
+                page = page.alert(
+                    AlertLevel::Info,
+                    "Preparing a quote. This asks makers over Tor and waits on discovery, so it \
+                     takes a while. Reload to see it.",
+                );
+            }
+            QuoteState::Failed(why) => {
+                page = page.alert(AlertLevel::Danger, format!("No quote: {why}"));
+            }
+            QuoteState::Ready(quote) => {
+                page = page
+                    .alert(
+                        AlertLevel::Success,
+                        format!(
+                            "Quote ready. Sending {} costs {} in fees and delivers {}. Nothing \
+                             has been committed yet.",
+                            Self::sats(quote.send_sat),
+                            Self::sats(quote.total_fee_sat),
+                            Self::sats(quote.receive_sat)
+                        ),
+                    )
+                    .stats(
+                        Stats::new()
+                            .card("Swap", quote.swap_id.chars().take(16).collect::<String>())
+                            .card("Sending", Self::sats(quote.send_sat))
+                            .card("Fees", Self::sats(quote.total_fee_sat))
+                            .card("You receive", Self::sats(quote.receive_sat))
+                            .detail("After every hop's fee."),
+                    );
+
+                let mut hops =
+                    Table::new(["Hop", "Maker", "Locktime (blocks)", "Fee"]).title("Route");
+                for (index, hop) in quote.hops.iter().enumerate() {
+                    hops = hops.row([
+                        (index + 1).to_string(),
+                        hop.address.clone(),
+                        hop.locktime.to_string(),
+                        Self::sats(hop.fee_sat),
+                    ]);
+                }
+                page = page.table(hops).actions(
+                    Actions::new()
+                        .title("This quote")
+                        .button(Button::new("discard-quote", "Discard and start over")),
+                );
+            }
+        }
+
         if self.taker.wallet_open() {
             page = page
                 .actions(
@@ -211,6 +263,19 @@ impl CoinswapPlugin {
                 )
                 // A form, not a command: a button carries neither address nor amount. Arrives
                 // as `FormSubmitted` because its id is not "settings".
+                // A quote is a question, not a spend, so nothing is confirmed here.
+                .form(
+                    Form::new("quote")
+                        .title("Request a swap quote")
+                        .number("sats", "Amount to swap (sats)")
+                        .required()
+                        .range(1, i64::MAX)
+                        .number("makers", "Makers in the route")
+                        .required()
+                        .range(1, 10)
+                        .help("More hops cost more and gain more privacy.")
+                        .submit_label("Get a quote"),
+                )
                 .form(
                     Form::new("withdraw")
                         .title("Withdraw")
@@ -504,6 +569,41 @@ impl CoinswapPlugin {
         Self::report(outcome, "withdraw")
     }
 
+    /// Asks for a quote, parsing what the form sent.
+    fn request_quote(
+        &self,
+        values: &std::collections::HashMap<String, String>,
+    ) -> Vec<PluginAction> {
+        let number = |key: &str| {
+            values
+                .get(key)
+                .and_then(|raw| raw.trim().parse::<u64>().ok())
+        };
+
+        let outcome = match (number("sats"), number("makers")) {
+            (Some(sats), Some(makers)) => {
+                let logger = match self.host() {
+                    Some(host) => Self::logger(host),
+                    None => {
+                        return Self::report(
+                            Err("The plugin has not finished starting yet.".to_string()),
+                            "quote",
+                        )
+                    }
+                };
+                self.taker
+                    .request_quote(sats, makers as usize, logger)
+                    .map(|()| {
+                        "Preparing a quote. It asks makers over Tor, so reload in a moment."
+                            .to_string()
+                    })
+            }
+            _ => Err("The amount and the maker count must both be whole numbers.".to_string()),
+        };
+
+        Self::report(outcome, "quote")
+    }
+
     /// Turns an outcome into what the host should do about it.
     ///
     /// Failures are logged as well as shown: a page message dies with the page.
@@ -555,6 +655,10 @@ impl CoinswapPlugin {
                 }
                 None => Err("The plugin has not finished starting yet.".to_string()),
             },
+            "discard-quote" => {
+                self.taker.clear_quote();
+                Ok("Quote discarded.".to_string())
+            }
             "taker-address" => self.taker.receive_address().map(|address| {
                 format!(
                     "Send funds to {address} to top up the taker wallet. This is the taker's own \
@@ -709,6 +813,7 @@ impl Plugin for CoinswapPlugin {
             // mistaken for reconfiguring the plugin.
             HostEvent::FormSubmitted { form_id, values } => match form_id.as_str() {
                 "withdraw" => Ok(self.withdraw(&values)),
+                "quote" => Ok(self.request_quote(&values)),
                 other => Err(PluginError::invalid_input(format!("unknown form: {other}"))),
             },
 
@@ -984,5 +1089,48 @@ mod tests {
             .filter(|action| matches!(action, PluginAction::ShowMessage { .. }))
             .count();
         assert_eq!(messages, 2, "one message per role");
+    }
+
+    #[test]
+    fn a_quote_is_not_offered_before_the_wallet_is_open() {
+        let json = taker_json(&CoinswapPlugin::default());
+        assert!(!json.contains("\"quote\""));
+    }
+
+    #[test]
+    fn a_quote_request_before_the_wallet_is_open_is_reported() {
+        let plugin = CoinswapPlugin::default();
+        let actions = plugin.request_quote(&std::collections::HashMap::from([
+            ("sats".to_string(), "100000".to_string()),
+            ("makers".to_string(), "2".to_string()),
+        ]));
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            PluginAction::ShowMessage {
+                level: MessageLevel::Error,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn a_quote_request_with_junk_numbers_is_refused_by_the_plugin() {
+        // The plugin should not depend on the host checking its input.
+        let plugin = CoinswapPlugin::default();
+        for values in [
+            [("sats", "lots"), ("makers", "2")],
+            [("sats", "100000"), ("makers", "")],
+        ] {
+            let map: std::collections::HashMap<String, String> = values
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let actions = plugin.request_quote(&map);
+            assert!(actions.iter().any(|action| matches!(
+                action,
+                PluginAction::ShowMessage { level: MessageLevel::Error, text }
+                    if text.contains("whole numbers")
+            )));
+        }
     }
 }
