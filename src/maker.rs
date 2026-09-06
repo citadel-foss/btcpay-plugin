@@ -315,6 +315,22 @@ impl MakerRuntime {
         };
 
         // No `check_swap_liquidity` here: it makes RPC calls, and a page render must not.
+        // `try_lock` again: the maker holds this while it works a swap.
+        let swaps = match maker.swap_tracker.try_lock() {
+            Ok(tracker) => tracker
+                .incomplete_swaps()
+                .into_iter()
+                .map(|record| SwapRecord {
+                    id: record.swap_id.chars().take(16).collect(),
+                    phase: format!("{:?}", record.phase),
+                    recovery: format!("{:?}", record.recovery.phase),
+                    amount_sat: record.swap_amount_sat,
+                    funded: record.funding_broadcast,
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+
         Status {
             phase,
             balances,
@@ -323,6 +339,7 @@ impl MakerRuntime {
             bonds,
             wallet_busy,
             port: Some(maker.config.network_port),
+            swaps,
         }
     }
 
@@ -377,6 +394,28 @@ impl Default for MakerRuntime {
     }
 }
 
+/// One swap the maker has a record of.
+///
+/// Owned rather than borrowed: the tracker sits behind a mutex the maker itself takes.
+pub struct SwapRecord {
+    /// Short identifier, as coinswap logs it.
+    pub id: String,
+    pub phase: String,
+    pub recovery: String,
+    pub amount_sat: u64,
+    /// Whether a funding transaction reached the chain.
+    ///
+    /// If false there is nothing on-chain to recover.
+    pub funded: bool,
+}
+
+impl SwapRecord {
+    /// True when this swap still has funds on chain that recovery has not finished returning.
+    pub fn funds_at_stake(&self) -> bool {
+        self.funded && self.recovery != "CleanedUp" && self.phase != "Completed"
+    }
+}
+
 /// A point-in-time view of the maker, cheap enough to build on every page load.
 ///
 /// A snapshot, so rendering never holds the wallet lock while the maker wants it.
@@ -394,6 +433,8 @@ pub struct Status {
     pub wallet_busy: bool,
     /// The port takers reach this maker on, when it is up.
     pub port: Option<u16>,
+    /// Swaps the maker has records for, newest first. Empty when it has none or was busy.
+    pub swaps: Vec<SwapRecord>,
 }
 
 impl Status {
@@ -405,6 +446,7 @@ impl Status {
             bonds: Vec::new(),
             wallet_busy: false,
             port: None,
+            swaps: Vec::new(),
         }
     }
 }
@@ -531,5 +573,36 @@ mod tests {
         assert!(runtime
             .start(MakerServerConfig::default(), Logger::silent())
             .is_err());
+    }
+
+    fn record(phase: &str, recovery: &str, funded: bool) -> SwapRecord {
+        SwapRecord {
+            id: "abc123".to_string(),
+            phase: phase.to_string(),
+            recovery: recovery.to_string(),
+            amount_sat: 100_000,
+            funded,
+        }
+    }
+
+    #[test]
+    fn a_swap_with_a_broadcast_funding_tx_still_recovering_has_funds_at_stake() {
+        // Seen on signet: the taker went away mid-swap, funding is on chain, and the maker is
+        // waiting on a timelock.
+        assert!(record("Recovering", "TimelockWaiting", true).funds_at_stake());
+        assert!(record("Recovering", "Monitoring", true).funds_at_stake());
+    }
+
+    #[test]
+    fn a_swap_that_never_reached_the_chain_has_nothing_at_stake() {
+        // No funding broadcast means no contract to recover, so a warning would send the
+        // operator looking for money that was never spent.
+        assert!(!record("Recovering", "TimelockWaiting", false).funds_at_stake());
+    }
+
+    #[test]
+    fn a_cleaned_up_or_completed_swap_has_nothing_at_stake() {
+        assert!(!record("Recovered", "CleanedUp", true).funds_at_stake());
+        assert!(!record("Completed", "NotStarted", true).funds_at_stake());
     }
 }
