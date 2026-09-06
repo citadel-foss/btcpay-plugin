@@ -179,8 +179,10 @@ impl CoinswapPlugin {
         if status.recovery_complete == Some(false) {
             page = page.alert(
                 AlertLevel::Warning,
-                "A previous swap was interrupted and is still being recovered. Its funds are in \
-                 timelocked contracts until that finishes. Do not start another swap yet.",
+                "A previous swap is still being recovered, so its funds are in contracts until \
+                 their timelocks expire. coinswap does this itself and needs nothing from you; \
+                 a new swap is refused until it finishes, because starting one now would commit \
+                 funds on top of funds already committed.",
             );
         }
 
