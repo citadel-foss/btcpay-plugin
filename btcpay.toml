@@ -1,0 +1,13 @@
+# Build settings for this plugin.
+#
+# Identity (identifier, name, version, dependencies) is deliberately not here: it lives in
+# src/lib.rs and is read back from the compiled library, so there is no second copy to keep
+# in step.
+
+[build]
+# BTCPay Server tag the C# is compiled against. BTCPayServer.Abstractions is not published
+# on NuGet, so a source checkout is required; `cargo btcpay` fetches and caches it.
+btcpay_tag = "v2.4.1"
+
+# Runtime identifiers to build for. linux-x64 is what BTCPay deployments actually run.
+targets = ["linux-x64"]
