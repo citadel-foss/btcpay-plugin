@@ -34,7 +34,7 @@ use btcpay_plugin::prelude::*;
 use maker::{MakerRuntime, Status};
 use settings::Settings;
 use shared::{lock, Logger, Phase};
-use taker::{QuoteState, TakerRuntime};
+use taker::{QuoteState, SwapState, TakerRuntime};
 
 /// How long a drain command waits for an idle swap to wind up.
 ///
@@ -202,6 +202,58 @@ impl CoinswapPlugin {
 
         page = page.stats(stats);
 
+        match self.taker.swap_state() {
+            SwapState::Idle => {}
+            SwapState::Running { swap_id, since } => {
+                page = page.alert(
+                    AlertLevel::Warning,
+                    format!(
+                        "Swap {} is running, {} minutes in. Its funds are committed on chain. \
+                         Leave BTCPay running: stopping it now leaves contracts to recover from, \
+                         which takes until their timelocks expire.",
+                        swap_id.chars().take(16).collect::<String>(),
+                        since.elapsed().as_secs() / 60
+                    ),
+                );
+            }
+            SwapState::Failed { swap_id, why } => {
+                page = page
+                    .alert(
+                        AlertLevel::Danger,
+                        format!(
+                            "Swap {} did not finish: {why}. If it got as far as funding, the \
+                             coins are in contracts and come back when their timelocks expire.",
+                            swap_id.chars().take(16).collect::<String>()
+                        ),
+                    )
+                    .actions(
+                        Actions::new().button(Button::new("clear-swap", "Dismiss and start over")),
+                    );
+            }
+            SwapState::Done(outcome) => {
+                page = page
+                    .alert(
+                        AlertLevel::Success,
+                        format!(
+                            "Swap {} finished as {}, in {:.0} seconds.",
+                            outcome.swap_id.chars().take(16).collect::<String>(),
+                            outcome.status,
+                            outcome.duration_secs
+                        ),
+                    )
+                    .stats(
+                        Stats::new()
+                            .card("Sent", Self::sats(outcome.sent_sat))
+                            .card("Received", Self::sats(outcome.received_sat))
+                            .card("Maker fees", Self::sats(outcome.maker_fees_sat))
+                            .card("Mining fee", Self::sats(outcome.mining_fee_sat)),
+                    )
+                    .actions(
+                        Actions::new().button(Button::new("clear-swap", "Clear and start over")),
+                    );
+            }
+        }
+
         // The quote, above the wallet: it is what the operator is waiting on.
         match self.taker.quote_state() {
             QuoteState::Idle => {}
@@ -249,12 +301,27 @@ impl CoinswapPlugin {
                 page = page.table(hops).actions(
                     Actions::new()
                         .title("This quote")
+                        .button(
+                            Button::new("accept-quote", "Accept and swap")
+                                .primary()
+                                .confirm(format!(
+                                    "This commits {} on chain across {} hop(s) and pays {} in \
+                                     fees. Once it starts, stopping BTCPay leaves contracts to \
+                                     recover from, which takes until their timelocks expire. \
+                                     Continue?",
+                                    Self::sats(quote.send_sat),
+                                    quote.hops.len(),
+                                    Self::sats(quote.total_fee_sat)
+                                )),
+                        )
                         .button(Button::new("discard-quote", "Discard and start over")),
                 );
             }
         }
 
-        if self.taker.wallet_open() {
+        // Nothing needing the taker is offered while a swap holds it; both would fail on the
+        // lock.
+        if self.taker.wallet_open() && !self.taker.swap_running() {
             page = page
                 .actions(
                     Actions::new()
@@ -655,6 +722,19 @@ impl CoinswapPlugin {
                 }
                 None => Err("The plugin has not finished starting yet.".to_string()),
             },
+            "accept-quote" => match self.host() {
+                Some(host) => self.taker.accept_quote(Self::logger(host)).map(|swap_id| {
+                    format!(
+                        "Swap {} started. It runs for a while; reload to follow it.",
+                        swap_id.chars().take(16).collect::<String>()
+                    )
+                }),
+                None => Err("The plugin has not finished starting yet.".to_string()),
+            },
+            "clear-swap" => self
+                .taker
+                .clear_swap()
+                .map(|()| "Cleared. Request a new quote when you want one.".to_string()),
             "discard-quote" => {
                 self.taker.clear_quote();
                 Ok("Quote discarded.".to_string())
