@@ -12,6 +12,7 @@ pub enum Phase {
     Stopped,
     /// Connecting to the backend and opening the wallet.
     Starting,
+    /// Started, and doing its job.
     Running,
     /// The string is for the operator, not for a machine.
     Failed(String),
@@ -75,6 +76,7 @@ pub struct Logger(Arc<LogSink>);
 type LogSink = dyn Fn(bool, &str) + Send + Sync;
 
 impl Logger {
+    /// Wraps a sink taking (is_error, message).
     pub fn new(sink: impl Fn(bool, &str) + Send + Sync + 'static) -> Self {
         Self(Arc::new(sink))
     }
