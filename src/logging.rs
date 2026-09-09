@@ -89,49 +89,8 @@ mod tests {
     #[test]
     fn installing_twice_does_not_panic() {
         // `set_boxed_logger` refuses a second call; a plugin restart in one BTCPay process does that.
-        install(Arc::new(Discard));
-        install(Arc::new(Discard));
+        install(Arc::new(crate::testing::Discard));
+        install(Arc::new(crate::testing::Discard));
         detach();
-    }
-
-    /// A `HostServices` that does nothing.
-    struct Discard;
-
-    impl HostServices for Discard {
-        fn get_setting(&self, _key: String) -> Option<String> {
-            None
-        }
-        fn set_setting(
-            &self,
-            _key: String,
-            _value: String,
-        ) -> Result<(), btcpay_plugin::HostError> {
-            Ok(())
-        }
-        fn store_get(&self, _key: String) -> Option<Vec<u8>> {
-            None
-        }
-        fn store_put(&self, _key: String, _value: Vec<u8>) -> Result<(), btcpay_plugin::HostError> {
-            Ok(())
-        }
-        fn store_delete(&self, _key: String) -> Result<(), btcpay_plugin::HostError> {
-            Ok(())
-        }
-        fn data_dir(&self) -> String {
-            String::new()
-        }
-        fn log(&self, _level: LogLevel, _message: String) {}
-        fn emit_notification(
-            &self,
-            _notification: btcpay_plugin::Notification,
-        ) -> Result<(), btcpay_plugin::HostError> {
-            Ok(())
-        }
-        fn send_webhook(
-            &self,
-            _webhook: btcpay_plugin::WebhookRequest,
-        ) -> Result<(), btcpay_plugin::HostError> {
-            Ok(())
-        }
     }
 }

@@ -19,11 +19,14 @@
 #![deny(missing_docs)]
 #![warn(clippy::all)]
 
+pub mod alerts;
 pub mod logging;
 pub mod maker;
 pub mod settings;
 pub mod shared;
 pub mod taker;
+#[cfg(test)]
+mod testing;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -31,6 +34,7 @@ use std::time::Duration;
 
 use btcpay_plugin::prelude::*;
 
+use alerts::{Watcher, WatcherSlot};
 use maker::{MakerRuntime, Status};
 use settings::Settings;
 use shared::{lock, Logger, Phase};
@@ -46,16 +50,22 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
 /// A maker mid-swap has contracts to watch; past this, BTCPay's own shutdown matters more.
 const STOP_DEADLINE: Duration = Duration::from_secs(30);
 
+/// Where a notification sends the operator.
+///
+/// The route `cargo btcpay` generates from the plugin identifier, plus the dashboard page id.
+const DASHBOARD_LINK: &str = "/plugins/btcpayserver-plugins-coinswap/dashboard";
+
 /// The plugin.
 #[derive(Default)]
 pub struct CoinswapPlugin {
-    maker: MakerRuntime,
+    maker: Arc<MakerRuntime>,
     taker: TakerRuntime,
     /// Cached so rendering a page does not re-read storage field by field across the FFI
     /// boundary.
     settings: Mutex<Option<Settings>>,
     /// Kept from `start` so a command can log and find the data directory.
     host: Mutex<Option<Arc<dyn HostServices>>>,
+    watcher: WatcherSlot,
 }
 
 impl CoinswapPlugin {
@@ -809,6 +819,13 @@ impl Plugin for CoinswapPlugin {
             );
         }
 
+        self.watcher.replace(Watcher::start(
+            Arc::clone(&self.maker),
+            Arc::clone(&host),
+            DASHBOARD_LINK.to_string(),
+            Self::logger(Arc::clone(&host)),
+        ));
+
         if settings.taker_enabled {
             if let Err(error) = self.reconcile_taker(&settings) {
                 host.log(
@@ -823,6 +840,7 @@ impl Plugin for CoinswapPlugin {
 
     fn stop(&self) {
         let logger = self.host().map_or_else(Logger::silent, Self::logger);
+        self.watcher.clear();
         // The maker first: it has counterparties waiting, so it gets the larger share of the
         // shutdown budget.
         self.maker.stop(STOP_DEADLINE, &logger);
