@@ -12,12 +12,13 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use crate::alerts::Observation;
 use crate::shared::{
     describe, lock, sleep_unless_stopped, Logger, Phase, SendOnDrop, RETRY_BACKOFF, START_ATTEMPTS,
 };
 use coinswap::maker::{start_server, MakerServer, MakerServerConfig};
 use coinswap::utill::check_tor_status;
-use coinswap::wallet::{AddressType, Balances};
+use coinswap::wallet::{AddressType, Balances, Wallet};
 
 /// State both the maker thread and the plugin touch.
 ///
@@ -343,6 +344,47 @@ impl MakerRuntime {
         }
     }
 
+    /// What the alert watcher needs, in one pass.
+    ///
+    /// Reads the chain tip over RPC, so this belongs on the watcher's own thread and never in a
+    /// page render.
+    pub fn observe(&self) -> Observation {
+        let (phase, maker) = {
+            let shared = lock(&self.shared);
+            (shared.phase.clone(), shared.maker.clone())
+        };
+
+        let Some(maker) = maker else {
+            return Observation::only_phase(phase);
+        };
+
+        let (spendable_sat, bond_expiry_blocks) = match maker.wallet.try_read() {
+            Ok(wallet) => (
+                wallet.get_balances().ok().map(|b| b.spendable.to_sat()),
+                blocks_until_bond_expiry(&wallet),
+            ),
+            Err(_) => (None, None),
+        };
+
+        let unfinished_funded_swaps = match maker.swap_tracker.try_lock() {
+            Ok(tracker) => tracker
+                .incomplete_swaps()
+                .into_iter()
+                .filter(|record| record.funding_broadcast)
+                .map(|record| record.swap_id.chars().take(16).collect())
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+
+        Observation {
+            phase,
+            spendable_sat,
+            min_swap_sat: Some(maker.config.min_swap_amount),
+            bond_expiry_blocks,
+            unfinished_funded_swaps,
+        }
+    }
+
     /// True when the wallet is open and can be queried, which outlasts a failed start.
     pub fn wallet_open(&self) -> bool {
         lock(&self.shared).maker.is_some()
@@ -386,6 +428,32 @@ impl MakerRuntime {
             .map(|drained| drained.len())
             .map_err(|error| format!("Could not drain idle swaps: {}", describe(error)))
     }
+}
+
+/// Blocks until the soonest-expiring unspent bond matures.
+///
+/// The soonest rather than the largest: whichever bond takers weighed, the maker loses its
+/// standing when one it holds matures unreplaced.
+fn blocks_until_bond_expiry(wallet: &Wallet) -> Option<u64> {
+    /// Locktimes at or above this are timestamps, which fidelity bonds do not use.
+    const TIMESTAMP_THRESHOLD: u32 = 500_000_000;
+
+    let heights: Vec<u64> = wallet
+        .get_fidelity_bonds()
+        .iter()
+        .filter(|bond| !bond.is_spent())
+        .filter_map(|bond| {
+            let raw = bond.lock_time.to_consensus_u32();
+            (raw < TIMESTAMP_THRESHOLD).then_some(u64::from(raw))
+        })
+        .collect();
+
+    if heights.is_empty() {
+        return None;
+    }
+
+    let (tip, _) = wallet.chain_tip().ok()?;
+    heights.into_iter().map(|h| h.saturating_sub(tip)).min()
 }
 
 impl Default for MakerRuntime {
