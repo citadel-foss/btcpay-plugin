@@ -20,8 +20,11 @@ use crate::shared::{describe, lock, Logger, Phase, SendOnDrop};
 
 /// One hop of a quote: the maker at that position and what it charges.
 pub struct QuoteHop {
+    /// The maker's address, as the offerbook lists it.
     pub address: String,
+    /// Blocks this hop's contract stays locked.
     pub locktime: u16,
+    /// What this maker charges, in satoshis.
     pub fee_sat: u64,
 }
 
@@ -31,9 +34,13 @@ pub struct QuoteHop {
 pub struct Quote {
     /// Identifies the prepared swap, and is what executing it will refer to.
     pub swap_id: String,
+    /// What would leave the wallet, in satoshis.
     pub send_sat: u64,
+    /// The whole cost of the swap, in satoshis.
     pub total_fee_sat: u64,
+    /// What would arrive after fees, in satoshis.
     pub receive_sat: u64,
+    /// The route, in order.
     pub hops: Vec<QuoteHop>,
 }
 
@@ -42,7 +49,9 @@ pub struct Quote {
 /// `prepare_coinswap` syncs the offerbook over Tor and waits on Nostr discovery, far too long
 /// for the operator's request, so it runs on a thread and the page reports what it finds.
 pub enum QuoteState {
+    /// No quote has been asked for.
     Idle,
+    /// Syncing the offerbook and building a route.
     Preparing,
     /// Nothing has been committed.
     Ready(Quote),
@@ -52,12 +61,19 @@ pub enum QuoteState {
 
 /// How a finished swap turned out.
 pub struct SwapOutcome {
+    /// Identifies the swap coinswap reported on.
     pub swap_id: String,
+    /// How coinswap classified the end of it.
     pub status: String,
+    /// What left the wallet, in satoshis.
     pub sent_sat: u64,
+    /// What arrived, in satoshis.
     pub received_sat: u64,
+    /// Paid to the makers on the route, in satoshis.
     pub maker_fees_sat: u64,
+    /// Paid to miners, in satoshis.
     pub mining_fee_sat: u64,
+    /// How long the swap took.
     pub duration_secs: f64,
 }
 
@@ -66,16 +82,22 @@ pub struct SwapOutcome {
 /// Separate from [`QuoteState`]: a quote can be thrown away, a running swap has funds in
 /// contracts.
 pub enum SwapState {
+    /// No swap running.
     Idle,
     /// Funds are committed on chain from here on.
     Running {
+        /// Identifies the running swap.
         swap_id: String,
+        /// When it started, so the page can show how long it has been going.
         since: std::time::Instant,
     },
+    /// Finished, however it turned out.
     Done(SwapOutcome),
     /// Funds may be in contracts awaiting recovery.
     Failed {
+        /// Identifies the swap that failed.
         swap_id: String,
+        /// For the operator, not for a machine.
         why: String,
     },
 }
@@ -112,6 +134,7 @@ pub struct TakerRuntime {
 
 /// A point-in-time view of the taker's wallet, cheap enough for every page load.
 pub struct Status {
+    /// What the taker's wallet is doing.
     pub phase: Phase,
     /// Balances, absent when the wallet is shut or its lock was busy.
     pub balances: Option<Balances>,

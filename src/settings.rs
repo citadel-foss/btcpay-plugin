@@ -80,8 +80,10 @@ pub enum Chain {
     /// Real money.
     #[choice(value = "mainnet", label = "Mainnet")]
     Mainnet,
+    /// The public test network.
     #[choice(value = "testnet4", label = "Testnet4")]
     Testnet4,
+    /// The test network whose blocks are signed rather than mined.
     #[choice(value = "signet", label = "Signet")]
     Signet,
     /// The default, so an unconfigured plugin cannot touch real funds.
@@ -107,6 +109,9 @@ impl Chain {
 /// name -- coinswap keeps maker and taker wallets as separate files with separate seeds.
 ///
 /// Both roles default to off: neither should start because somebody clicked install.
+// Every field carries a `label` and `help`, which is the operator-facing description and
+// the one that has to be right. A doc comment would be a second copy to keep in step.
+#[allow(missing_docs)]
 #[derive(BtcpaySettings, Clone, Debug)]
 pub struct Settings {
     #[setting(

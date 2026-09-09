@@ -400,8 +400,11 @@ impl Default for MakerRuntime {
 pub struct SwapRecord {
     /// Short identifier, as coinswap logs it.
     pub id: String,
+    /// coinswap's swap phase, under the name coinswap gives it.
     pub phase: String,
+    /// coinswap's recovery phase, under the name coinswap gives it.
     pub recovery: String,
+    /// Swap amount, in satoshis.
     pub amount_sat: u64,
     /// Whether a funding transaction reached the chain.
     ///
@@ -420,6 +423,7 @@ impl SwapRecord {
 ///
 /// A snapshot, so rendering never holds the wallet lock while the maker wants it.
 pub struct Status {
+    /// What the maker is doing.
     pub phase: Phase,
     /// Wallet balances, absent when the maker is down or the wallet lock was busy.
     pub balances: Option<Balances>,
