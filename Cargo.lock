@@ -353,7 +353,8 @@ dependencies = [
 
 [[package]]
 name = "btcpay-plugin"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
+source = "git+https://github.com/uqlidi/btcpay-rs#7280c068f4ff7b423b63a22a529d953b8f861c4b"
 dependencies = [
  "btcpay-plugin-macros",
  "btcpay-ui",
@@ -364,7 +365,8 @@ dependencies = [
 
 [[package]]
 name = "btcpay-plugin-macros"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
+source = "git+https://github.com/uqlidi/btcpay-rs#7280c068f4ff7b423b63a22a529d953b8f861c4b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -373,7 +375,8 @@ dependencies = [
 
 [[package]]
 name = "btcpay-ui"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
+source = "git+https://github.com/uqlidi/btcpay-rs#7280c068f4ff7b423b63a22a529d953b8f861c4b"
 dependencies = [
  "serde",
  "serde_json",
