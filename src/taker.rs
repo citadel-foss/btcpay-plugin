@@ -11,8 +11,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use std::io::ErrorKind;
+
 use coinswap::bitcoin::Amount;
+use coinswap::error::NetError;
 use coinswap::protocol::common_messages::ProtocolVersion;
+use coinswap::taker::error::TakerError;
 use coinswap::taker::{SwapParams, Taker, TakerInitConfig};
 use coinswap::wallet::{AddressType, Balances};
 
@@ -99,6 +103,9 @@ pub enum SwapState {
         swap_id: String,
         /// For the operator, not for a machine.
         why: String,
+        /// Whether funds left the wallet, checked against the chain after the failure. `None`
+        /// when that could not be checked.
+        committed: Option<bool>,
     },
 }
 
@@ -465,8 +472,12 @@ impl TakerRuntime {
                 // Held for the whole negotiation; everything else uses `try_lock` and reports
                 // busy rather than queueing.
                 let outcome = match handle.lock() {
-                    Ok(mut taker) => sync_wallet(&taker)
-                        .and_then(|()| taker.prepare_coinswap(params).map_err(describe)),
+                    Ok(mut taker) => sync_wallet(&taker).and_then(|()| {
+                        taker.prepare_coinswap(params).map_err(|error| {
+                            log.error(&format!("Quote failed: {}", describe(&error)));
+                            explain(&error)
+                        })
+                    }),
                     Err(_) => Err("The taker is locked by a failed operation.".to_string()),
                 };
 
@@ -517,9 +528,14 @@ impl TakerRuntime {
                 swap_id: swap_id.clone(),
                 since: *since,
             },
-            SwapState::Failed { swap_id, why } => SwapState::Failed {
+            SwapState::Failed {
+                swap_id,
+                why,
+                committed,
+            } => SwapState::Failed {
                 swap_id: swap_id.clone(),
                 why: why.clone(),
+                committed: *committed,
             },
             SwapState::Done(outcome) => SwapState::Done(SwapOutcome {
                 swap_id: outcome.swap_id.clone(),
@@ -599,8 +615,23 @@ impl TakerRuntime {
                 ));
 
                 let outcome = match handle.lock() {
-                    Ok(mut taker) => taker.start_coinswap(&started).map_err(describe),
-                    Err(_) => Err("The taker is locked by a failed operation.".to_string()),
+                    Ok(mut taker) => {
+                        let before = wallet_totals(&taker);
+                        taker.start_coinswap(&started).map_err(|error| {
+                            log.error(&format!("Swap {started} failed: {}", describe(&error)));
+                            // Synced first: without it the balances are whatever they were
+                            // before the swap, and every failure would read as nothing moved.
+                            let after = sync_wallet(&taker)
+                                .ok()
+                                .and_then(|()| wallet_totals(&taker));
+                            let committed = before.zip(after).map(|(b, a)| funds_moved(b, a));
+                            (explain(&error), committed)
+                        })
+                    }
+                    Err(_) => Err((
+                        "The taker is locked by a failed operation.".to_string(),
+                        None,
+                    )),
                 };
 
                 let mut shared = lock(&shared);
@@ -620,11 +651,12 @@ impl TakerRuntime {
                             duration_secs: report.swap_duration_seconds,
                         })
                     }
-                    Err(why) => {
+                    Err((why, committed)) => {
                         log.error(&format!("Swap {started} did not finish: {why}"));
                         SwapState::Failed {
                             swap_id: started,
                             why,
+                            committed,
                         }
                     }
                 };
@@ -722,6 +754,55 @@ impl TakerRuntime {
 impl Default for TakerRuntime {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Spendable and in-contract balances, in satoshis. `None` when the wallet could not be read.
+fn wallet_totals(taker: &Taker) -> Option<(u64, u64)> {
+    let wallet = taker.get_wallet().read().ok()?;
+    let balances = wallet.get_balances().ok()?;
+    Some((balances.spendable.to_sat(), balances.contract.to_sat()))
+}
+
+/// Whether a swap took coins out of the wallet, from (spendable, contract) before and after.
+///
+/// A deposit landing during the swap only raises spendable, so it cannot read as a loss.
+fn funds_moved(before: (u64, u64), after: (u64, u64)) -> bool {
+    after.0 < before.0 || after.1 > before.1
+}
+
+/// What went wrong with a quote or a swap, in words an operator can act on.
+///
+/// coinswap's errors have no `Display`, and their debug form names Rust types. The raw form
+/// still goes to the log.
+fn explain(error: &TakerError) -> String {
+    const HUNG_UP: &str = "a maker on the route closed the connection partway through.";
+    match error {
+        TakerError::Net(NetError::IO(io))
+            if matches!(
+                io.kind(),
+                ErrorKind::UnexpectedEof
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::BrokenPipe
+            ) =>
+        {
+            HUNG_UP.to_string()
+        }
+        TakerError::Net(NetError::ReachedEOF) => HUNG_UP.to_string(),
+        TakerError::Net(NetError::ConnectionTimedOut) => {
+            "a maker on the route stopped responding.".to_string()
+        }
+        TakerError::TorError(_) => "Tor could not reach a maker.".to_string(),
+        TakerError::NotEnoughMakersInOfferBook => {
+            "not enough makers will take this swap. Too few are online, or the amount is outside \
+             the sizes they accept; try a larger amount or fewer makers."
+                .to_string()
+        }
+        TakerError::ContractsBroadcasted(_) => {
+            "contracts reached the chain before the swap finished.".to_string()
+        }
+        other => describe(other),
     }
 }
 
@@ -923,6 +1004,7 @@ mod tests {
         lock(&runtime.shared).swap = SwapState::Failed {
             swap_id: "abc".to_string(),
             why: "the makers went away".to_string(),
+            committed: Some(false),
         };
 
         assert!(runtime.clear_swap().is_ok());
@@ -942,5 +1024,42 @@ mod tests {
         let runtime = TakerRuntime::new();
         let err = runtime.accept_quote(Logger::silent()).unwrap_err();
         assert!(!err.contains("still being recovered"), "{err}");
+    }
+
+    #[test]
+    fn a_swap_that_spent_nothing_moved_nothing() {
+        assert!(!funds_moved((150_000_000, 0), (150_000_000, 0)));
+    }
+
+    #[test]
+    fn a_deposit_during_the_swap_is_not_a_loss() {
+        assert!(!funds_moved((150_000_000, 0), (150_050_000, 0)));
+    }
+
+    #[test]
+    fn spent_coins_or_new_contracts_count_as_moved() {
+        assert!(funds_moved((150_000_000, 0), (149_890_000, 0)));
+        assert!(funds_moved((150_000_000, 0), (150_000_000, 100_000)));
+    }
+
+    #[test]
+    fn a_maker_hanging_up_is_explained_in_words() {
+        let error = TakerError::Net(NetError::IO(std::io::Error::new(
+            ErrorKind::UnexpectedEof,
+            "failed to fill whole buffer",
+        )));
+        let text = explain(&error);
+        assert!(text.contains("closed the connection"));
+        assert!(!text.contains("UnexpectedEof"));
+    }
+
+    #[test]
+    fn too_few_makers_points_at_the_amount() {
+        assert!(explain(&TakerError::NotEnoughMakersInOfferBook).contains("amount"));
+    }
+
+    #[test]
+    fn an_unrecognised_error_keeps_its_detail() {
+        assert!(explain(&TakerError::General("boom".to_string())).contains("boom"));
     }
 }

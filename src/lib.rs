@@ -228,13 +228,30 @@ impl CoinswapPlugin {
                     ),
                 );
             }
-            SwapState::Failed { swap_id, why } => {
+            SwapState::Failed {
+                swap_id,
+                why,
+                committed,
+            } => {
+                let funds = match committed {
+                    Some(false) => {
+                        "Nothing left the wallet, so there is nothing to recover and a new quote \
+                         can be requested."
+                    }
+                    Some(true) => {
+                        "Funds left the wallet and are held in contracts until their timelocks \
+                         expire. This page shows while their recovery is pending."
+                    }
+                    None => {
+                        "Whether funds left the wallet could not be checked. The balance on this \
+                         page shows it once the wallet has synced."
+                    }
+                };
                 page = page
                     .alert(
                         AlertLevel::Danger,
                         format!(
-                            "Swap {} did not finish: {why}. If it got as far as funding, the \
-                             coins are in contracts and come back when their timelocks expire.",
+                            "Swap {} did not finish: {why} {funds}",
                             swap_id.chars().take(16).collect::<String>()
                         ),
                     )
