@@ -14,8 +14,10 @@ use std::time::Duration;
 
 use crate::alerts::Observation;
 use crate::shared::{
-    describe, lock, sleep_unless_stopped, Logger, Phase, SendOnDrop, RETRY_BACKOFF, START_ATTEMPTS,
+    describe, lock, sleep_unless_stopped, unix_now, Logger, Phase, SendOnDrop, RETRY_BACKOFF,
+    START_ATTEMPTS,
 };
+use coinswap::maker::swap_tracker::{MakerRecoveryPhase, MakerSwapPhase};
 use coinswap::maker::{start_server, MakerServer, MakerServerConfig};
 use coinswap::utill::check_tor_status;
 use coinswap::wallet::{AddressType, Balances, Wallet};
@@ -322,6 +324,8 @@ impl MakerRuntime {
                 .incomplete_swaps()
                 .into_iter()
                 .map(|record| SwapRecord {
+                    tracker_key: record.swap_id.clone(),
+                    updated_at: record.updated_at,
                     id: record.swap_id.chars().take(16).collect(),
                     phase: format!("{:?}", record.phase),
                     recovery: format!("{:?}", record.recovery.phase),
@@ -383,6 +387,41 @@ impl MakerRuntime {
             bond_expiry_blocks,
             unfinished_funded_swaps,
         }
+    }
+
+    /// Marks a stale unfinished swap as dealt with, so the dashboard and notifications stop
+    /// reporting it.
+    ///
+    /// Changes the tracker record only. The coins stay where they are, and coinswap's recovery
+    /// is unaffected: it works from the wallet's swapcoins and reads just `funding_broadcast`
+    /// here, which this leaves alone.
+    pub fn dismiss_swap(&self, id: &str) -> Result<String, String> {
+        let maker = lock(&self.shared).maker.clone();
+        let Some(maker) = maker else {
+            return Err("The maker's wallet is not open.".to_string());
+        };
+
+        let mut tracker = maker.swap_tracker.try_lock().map_err(|_| {
+            "The maker is working on a swap right now. Try again in a moment.".to_string()
+        })?;
+        let Some(mut record) = tracker.get_record(id).cloned() else {
+            return Err(format!("There is no swap {id} on record."));
+        };
+        if unix_now().saturating_sub(record.updated_at) < STALE_AFTER_SECS {
+            return Err(format!(
+                "Swap {id} changed within the last day, so recovery may still be working on it."
+            ));
+        }
+
+        record.phase = MakerSwapPhase::Recovered;
+        record.recovery.phase = MakerRecoveryPhase::CleanedUp;
+        tracker
+            .save_record(&record)
+            .map_err(|error| format!("Could not update swap {id}: {}", describe(error)))?;
+
+        Ok(format!(
+            "Swap {id} dismissed. Nothing on chain was changed."
+        ))
     }
 
     /// True when the wallet is open and can be queried, which outlasts a failed start.
@@ -466,6 +505,10 @@ impl Default for MakerRuntime {
 ///
 /// Owned rather than borrowed: the tracker sits behind a mutex the maker itself takes.
 pub struct SwapRecord {
+    /// The full identifier the tracker is keyed by.
+    pub tracker_key: String,
+    /// When coinswap last changed this record, in Unix seconds.
+    pub updated_at: u64,
     /// Short identifier, as coinswap logs it.
     pub id: String,
     /// coinswap's swap phase, under the name coinswap gives it.
@@ -480,7 +523,18 @@ pub struct SwapRecord {
     pub funded: bool,
 }
 
+/// How long an unfinished swap may go unchanged before recovery is taken to have stalled.
+///
+/// Refund timelocks on this network are tens of blocks, a few hours, so a record untouched for
+/// a day is not waiting on one.
+pub const STALE_AFTER_SECS: u64 = 24 * 60 * 60;
+
 impl SwapRecord {
+    /// True when recovery has not touched this swap for [`STALE_AFTER_SECS`].
+    pub fn is_stale(&self, now: u64) -> bool {
+        now.saturating_sub(self.updated_at) >= STALE_AFTER_SECS
+    }
+
     /// True when this swap still has funds on chain that recovery has not finished returning.
     pub fn funds_at_stake(&self) -> bool {
         self.funded && self.recovery != "CleanedUp" && self.phase != "Completed"
@@ -649,6 +703,8 @@ mod tests {
 
     fn record(phase: &str, recovery: &str, funded: bool) -> SwapRecord {
         SwapRecord {
+            tracker_key: "abc123".to_string(),
+            updated_at: 0,
             id: "abc123".to_string(),
             phase: phase.to_string(),
             recovery: recovery.to_string(),
@@ -676,5 +732,24 @@ mod tests {
     fn a_cleaned_up_or_completed_swap_has_nothing_at_stake() {
         assert!(!record("Recovered", "CleanedUp", true).funds_at_stake());
         assert!(!record("Completed", "NotStarted", true).funds_at_stake());
+    }
+
+    #[test]
+    fn a_swap_untouched_for_a_day_is_stale() {
+        let swap = record("Recovering", "TimelockWaiting", true);
+        assert!(swap.is_stale(STALE_AFTER_SECS));
+        assert!(!swap.is_stale(STALE_AFTER_SECS - 1));
+    }
+
+    #[test]
+    fn a_clock_behind_the_record_does_not_make_it_stale() {
+        let mut swap = record("Recovering", "TimelockWaiting", true);
+        swap.updated_at = 1_000;
+        assert!(!swap.is_stale(0));
+    }
+
+    #[test]
+    fn dismissing_before_the_wallet_is_open_is_refused() {
+        assert!(MakerRuntime::new().dismiss_swap("abc123").is_err());
     }
 }
