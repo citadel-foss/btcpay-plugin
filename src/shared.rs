@@ -41,6 +41,13 @@ pub(crate) fn sleep_unless_stopped(total: Duration, stop_requested: &AtomicBool)
     }
     stop_requested.load(Ordering::Relaxed)
 }
+/// Seconds since the Unix epoch, the unit coinswap timestamps its records in.
+pub(crate) fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
 /// Turns a coinswap error into something an operator can read.
 ///
 /// `MakerError` has no `Display`, so the debug form is the only text available. In one place so

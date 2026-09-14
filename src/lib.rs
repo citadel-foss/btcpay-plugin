@@ -37,7 +37,7 @@ use btcpay_plugin::prelude::*;
 use alerts::{Watcher, WatcherSlot};
 use maker::{MakerRuntime, Status};
 use settings::Settings;
-use shared::{lock, Logger, Phase};
+use shared::{lock, unix_now, Logger, Phase};
 use taker::{QuoteState, SwapState, TakerRuntime};
 
 /// How long a drain command waits for an idle swap to wind up.
@@ -489,20 +489,39 @@ impl CoinswapPlugin {
 
         // Swaps first when any still has money on chain: funds sit in a contract until a
         // timelock releases them, and nothing else on this page would say so.
-        let at_stake: Vec<_> = status
+        let now = unix_now();
+        let (stale, recovering): (Vec<_>, Vec<_>) = status
             .swaps
             .iter()
             .filter(|swap| swap.funds_at_stake())
-            .collect();
-        if !at_stake.is_empty() {
-            let total: u64 = at_stake.iter().map(|swap| swap.amount_sat).sum();
+            .partition(|swap| swap.is_stale(now));
+        if !recovering.is_empty() {
+            let total: u64 = recovering.iter().map(|swap| swap.amount_sat).sum();
             page = page.alert(
                 AlertLevel::Warning,
                 format!(
                     "{} swap(s) did not finish, with {} still in contracts on chain. The maker \
                      recovers these itself once the timelock allows it, which can take a while. \
                      Leave it running: stopping it now delays recovery.",
-                    at_stake.len(),
+                    recovering.len(),
+                    Self::sats(total)
+                ),
+            );
+        }
+        // Separate because the advice is the opposite: waiting helps a swap still inside its
+        // timelock, and does nothing for one recovery has stopped advancing.
+        if !stale.is_empty() {
+            let total: u64 = stale.iter().map(|swap| swap.amount_sat).sum();
+            page = page.alert(
+                AlertLevel::Warning,
+                format!(
+                    "{} swap(s) have not changed for over a day, recorded at {} in contracts on \
+                     chain. Recovery is not advancing them, so leaving the maker running will \
+                     not bring these coins back. BTCPay's log says why on each maker start; look \
+                     for \"Reboot recovery failed\". If the coins are not the maker's to claim, \
+                     dismiss the swaps below. That only clears them from this page and from \
+                     notifications; nothing on chain changes.",
+                    stale.len(),
                     Self::sats(total)
                 ),
             );
@@ -521,6 +540,24 @@ impl CoinswapPlugin {
                 ]);
             }
             page = page.table(swaps);
+        }
+
+        if !stale.is_empty() {
+            let mut dismiss = Actions::new().title("Stalled swaps");
+            for swap in &stale {
+                dismiss = dismiss.button(
+                    Button::new(
+                        format!("dismiss-swap:{}", swap.tracker_key),
+                        format!("Dismiss {}", swap.id),
+                    )
+                    .destructive(format!(
+                        "Dismiss swap {}? It stops appearing here and in notifications. Its coins \
+                         stay where they are on chain.",
+                        swap.id
+                    )),
+                );
+            }
+            page = page.actions(dismiss);
         }
 
         let mut bonds = Table::new(["Amount", "Locked until"])
@@ -787,7 +824,10 @@ impl CoinswapPlugin {
                     format!("Drained {count} idle swap(s).")
                 }
             }),
-            other => Err(format!("Unknown command: {other}")),
+            other => match other.strip_prefix("dismiss-swap:") {
+                Some(id) => self.maker.dismiss_swap(id),
+                None => Err(format!("Unknown command: {other}")),
+            },
         };
 
         match outcome {
@@ -1249,5 +1289,28 @@ mod tests {
                     if text.contains("whole numbers")
             )));
         }
+    }
+
+    #[test]
+    fn dismissing_a_swap_before_the_maker_wallet_is_open_is_reported() {
+        let plugin = CoinswapPlugin::default();
+        let actions = plugin.run_command("dismiss-swap:abc123");
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            PluginAction::ShowMessage {
+                level: MessageLevel::Error,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn an_empty_dismissal_is_not_a_known_command() {
+        let plugin = CoinswapPlugin::default();
+        let actions = plugin.run_command("dismiss-swap");
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            PluginAction::ShowMessage { text, .. } if text.contains("Unknown command")
+        )));
     }
 }
