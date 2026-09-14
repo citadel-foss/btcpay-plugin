@@ -194,8 +194,8 @@ impl TakerRuntime {
 
     /// Opens the taker's wallet on its own thread.
     ///
-    /// `Taker::init` scans the chain and spawns an offer-sync thread; neither belongs on
-    /// BTCPay's startup path.
+    /// Opening spawns an offer-sync thread and then scans the chain, neither of which belongs
+    /// on BTCPay's startup path.
     pub fn start(&self, config: TakerInitConfig, log: Logger) -> Result<(), String> {
         let mut control = lock(&self.control);
         if self.is_live() {
@@ -251,6 +251,27 @@ impl TakerRuntime {
                         log.info("Taker wallet closed before it finished opening.");
                         lock(&shared).phase = Phase::Stopped;
                         return;
+                    }
+
+                    // coinswap's taker binary syncs here too. `Taker::init` does not, so
+                    // without this the wallet has no chain state and a funded wallet reports a
+                    // zero balance.
+                    log.info("Scanning the chain for the taker's coins.");
+                    match taker.get_wallet().write() {
+                        Ok(mut wallet) => {
+                            if let Err(error) = wallet.sync_and_save(&stop_requested) {
+                                let message = describe(error);
+                                log.error(&format!("The taker wallet could not sync: {message}"));
+                                lock(&shared).phase = Phase::Failed(message);
+                                return;
+                            }
+                        }
+                        Err(_) => {
+                            log.error("Could not sync the taker wallet: its lock was poisoned.");
+                            lock(&shared).phase =
+                                Phase::Failed("the wallet lock was poisoned".to_string());
+                            return;
+                        }
                     }
 
                     {
@@ -444,7 +465,8 @@ impl TakerRuntime {
                 // Held for the whole negotiation; everything else uses `try_lock` and reports
                 // busy rather than queueing.
                 let outcome = match handle.lock() {
-                    Ok(mut taker) => taker.prepare_coinswap(params).map_err(describe),
+                    Ok(mut taker) => sync_wallet(&taker)
+                        .and_then(|()| taker.prepare_coinswap(params).map_err(describe)),
                     Err(_) => Err("The taker is locked by a failed operation.".to_string()),
                 };
 
@@ -701,6 +723,19 @@ impl Default for TakerRuntime {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Brings the wallet's view of the chain up to date.
+///
+/// Called before quoting so coins that arrived after the wallet opened are counted, which is
+/// otherwise only done when it opens.
+fn sync_wallet(taker: &Taker) -> Result<(), String> {
+    taker
+        .get_wallet()
+        .write()
+        .map_err(|_| "The taker wallet lock is poisoned.".to_string())?
+        .sync_and_save(&std::sync::atomic::AtomicBool::new(false))
+        .map_err(describe)
 }
 
 #[cfg(test)]
