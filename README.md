@@ -57,7 +57,13 @@ Then, on the plugin's settings page:
 1. Pick the network and the chain source. The network defaults to Regtest, so an unconfigured
    plugin cannot touch real funds.
 2. Enter the Tor ports and the control password.
-3. Turn on **Run the maker**, **Enable the taker wallet**, or both, and save.
+3. Turn on **Run the maker**, **Enable the taker wallet**, or both, set a passphrase for each
+   wallet you turned on, and save.
+
+Wallet files are encrypted, and openswap will not open or create one without its passphrase. A
+passphrase is set once and then left alone: the settings page keeps the stored value when the
+field is left blank, and changing it does not re-encrypt an existing wallet, it only fails to
+open it.
 
 A new wallet shows its recovery phrase once. Write it down before leaving the page.
 

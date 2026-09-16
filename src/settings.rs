@@ -194,6 +194,15 @@ pub struct Settings {
     )]
     pub wallet_name: String,
 
+    /// Encrypts the maker's wallet file.
+    #[setting(
+        label = "Wallet passphrase",
+        help = "openswap encrypts every wallet file and will not open or create one without a \
+                passphrase. Lose it and the only way back in is the recovery phrase.",
+        secret
+    )]
+    pub wallet_passphrase: String,
+
     // --- Network ---
     #[setting(
         label = "Maker port",
@@ -274,6 +283,15 @@ pub struct Settings {
     )]
     pub taker_wallet_name: String,
 
+    /// Encrypts the taker's wallet file. Independent of the maker's: two wallets, two seeds.
+    #[setting(
+        label = "Taker wallet passphrase",
+        help = "openswap encrypts every wallet file and will not open or create one without a \
+                passphrase. Lose it and the only way back in is the recovery phrase.",
+        secret
+    )]
+    pub taker_wallet_passphrase: String,
+
     /// How the taker reaches makers.
     #[setting(
         label = "Reach makers over",
@@ -305,6 +323,7 @@ impl Default for Settings {
             electrum_url: String::new(),
             electrum_socks5: String::new(),
             wallet_name: "btcpay-maker".to_string(),
+            wallet_passphrase: String::new(),
             network_port: u32::from(reference.network_port),
             socks_port: u32::from(reference.socks_port),
             control_port: u32::from(reference.control_port),
@@ -321,6 +340,7 @@ impl Default for Settings {
             // Distinct from the maker's default on purpose: one wallet name for two wallets
             // would be an operator's worst afternoon.
             taker_wallet_name: "btcpay-taker".to_string(),
+            taker_wallet_passphrase: String::new(),
             taker_reach: Reach::Tor,
         }
     }
@@ -371,6 +391,13 @@ impl Settings {
             if self.taker_wallet_name.trim().is_empty() {
                 return Err("Taker wallet name is required.".to_string());
             }
+            if self.taker_wallet_passphrase.is_empty() {
+                return Err(
+                    "Taker wallet passphrase is required. openswap encrypts every wallet file \
+                     and refuses to open or create one without a passphrase."
+                        .to_string(),
+                );
+            }
             // Two openswap wallets on one file, and one Bitcoin Core watch-only wallet driven by
             // both, each treating the other's coins as its own. Refuse rather than discover it.
             if self.taker_wallet_name.trim() == self.wallet_name.trim() {
@@ -390,6 +417,14 @@ impl Settings {
             if port == 0 || port > u32::from(u16::MAX) {
                 return Err(format!("{label} must be between 1 and 65535."));
             }
+        }
+
+        if self.enabled && self.wallet_passphrase.is_empty() {
+            return Err(
+                "Wallet passphrase is required. openswap encrypts every wallet file and refuses \
+                 to open or create one without a passphrase."
+                    .to_string(),
+            );
         }
 
         // openswap authenticates to Tor by password, so an empty one cannot work. Caught here
@@ -473,7 +508,7 @@ impl Settings {
             control_port: Some(self.control_port as u16),
             tor_auth_password: Some(self.tor_auth_password.clone()),
             socks_port: self.socks_port as u16,
-            password: None,
+            password: Some(self.taker_wallet_passphrase.clone()),
             connection_type: self.taker_reach.to_connection_type(),
             ..TakerInitConfig::default()
         }
@@ -493,6 +528,7 @@ impl Settings {
             socks_port: self.socks_port as u16,
             control_port: self.control_port as u16,
             tor_auth_password: self.tor_auth_password.clone(),
+            password: Some(self.wallet_passphrase.clone()),
 
             base_fee: u64::from(self.base_fee),
             amount_relative_fee_pct: f64::from(self.amount_relative_fee_bps) / 100.0,
@@ -519,6 +555,8 @@ mod tests {
             enabled: true,
             wallet_name: "test-maker".to_string(),
             tor_auth_password: "hunter2".to_string(),
+            wallet_passphrase: "maker-phrase".to_string(),
+            taker_wallet_passphrase: "taker-phrase".to_string(),
             ..Settings::default()
         }
     }
@@ -766,6 +804,63 @@ mod tests {
             ..valid()
         };
         assert!(settings.check().unwrap_err().contains("must differ"));
+    }
+
+    #[test]
+    fn a_role_that_is_on_needs_a_wallet_passphrase() {
+        // openswap refuses to open or create a cleartext wallet file, and says so by pointing at
+        // a -p flag that has no meaning inside BTCPay. Catch it here instead.
+        let maker = Settings {
+            wallet_passphrase: String::new(),
+            ..valid()
+        };
+        assert!(maker.check().unwrap_err().contains("Wallet passphrase"));
+
+        let taker = Settings {
+            taker_enabled: true,
+            taker_wallet_passphrase: String::new(),
+            ..valid()
+        };
+        assert!(taker
+            .check()
+            .unwrap_err()
+            .contains("Taker wallet passphrase"));
+    }
+
+    #[test]
+    fn a_missing_passphrase_is_ignored_while_its_role_is_off() {
+        let settings = Settings {
+            enabled: false,
+            taker_enabled: false,
+            wallet_passphrase: String::new(),
+            taker_wallet_passphrase: String::new(),
+            ..valid()
+        };
+        assert!(settings.check().is_ok());
+    }
+
+    #[test]
+    fn each_wallet_file_gets_its_own_passphrase() {
+        // openswap seals a wallet with whatever it is handed, so crossing the two would lock
+        // each wallet under the other's passphrase.
+        let settings = Settings {
+            taker_enabled: true,
+            ..valid()
+        };
+        assert_eq!(
+            settings
+                .to_maker_config(PathBuf::from("/tmp/m"))
+                .password
+                .as_deref(),
+            Some("maker-phrase")
+        );
+        assert_eq!(
+            settings
+                .to_taker_config(PathBuf::from("/tmp/t"))
+                .password
+                .as_deref(),
+            Some("taker-phrase")
+        );
     }
 
     #[test]
