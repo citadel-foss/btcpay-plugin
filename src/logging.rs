@@ -1,6 +1,6 @@
-//! Forwards coinswap's own log output into BTCPay's log.
+//! Forwards openswap's own log output into BTCPay's log.
 //!
-//! Without an installed logger the `log` crate discards a library's records, and coinswap's
+//! Without an installed logger the `log` crate discards a library's records, and openswap's
 //! errors are too thin to diagnose a failure on their own.
 
 use std::sync::{Arc, OnceLock, RwLock};
@@ -43,14 +43,14 @@ impl log::Log for Bridge {
             log::Level::Trace => LogLevel::Trace,
         };
 
-        // The target prefix separates coinswap's records from the plugin's own.
+        // The target prefix separates openswap's records from the plugin's own.
         host.log(level, format!("[{}] {}", record.target(), record.args()));
     }
 
     fn flush(&self) {}
 }
 
-/// Routes coinswap's log records to `host` for as long as the plugin is running.
+/// Routes openswap's log records to `host` for as long as the plugin is running.
 ///
 /// Safe to call more than once: later calls only swap the destination.
 pub fn install(host: Arc<dyn HostServices>) {

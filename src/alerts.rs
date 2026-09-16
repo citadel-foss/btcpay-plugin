@@ -192,7 +192,7 @@ impl Watcher {
         let (finished_tx, finished) = mpsc::channel();
 
         let thread = std::thread::Builder::new()
-            .name("coinswap-alerts".to_string())
+            .name("openswap-alerts".to_string())
             .spawn({
                 let stop_requested = Arc::clone(&stop_requested);
                 move || {

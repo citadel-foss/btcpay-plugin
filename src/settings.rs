@@ -6,8 +6,8 @@
 use std::path::PathBuf;
 
 use btcpay_plugin::prelude::*;
-// Via coinswap's re-exports, so a version bump cannot leave two incompatible `Network` types.
-use coinswap::{
+// Via openswap's re-exports, so a version bump cannot leave two incompatible `Network` types.
+use openswap::{
     bitcoin::Network,
     bitcoind::bitcoincore_rpc::Auth,
     maker::MakerServerConfig,
@@ -15,17 +15,17 @@ use coinswap::{
     wallet::{BackendConfig, CoreRpcConfig, ElectrumConfig},
 };
 
-// Mirrored from coinswap `src/wallet/fidelity.rs`, which keeps them behind a private module.
-// Can drift from upstream. coinswap halves these under `integration-test`, which we do not enable.
+// Mirrored from openswap `src/wallet/fidelity.rs`, which keeps them behind a private module.
+// Can drift from upstream. openswap halves these under `integration-test`, which we do not enable.
 const MIN_FIDELITY_TIMELOCK: u32 = 12_960; // about 3 months
 const MAX_FIDELITY_TIMELOCK: u32 = 25_920; // about 6 months
 
-/// From coinswap `src/maker/api.rs`.
+/// From openswap `src/maker/api.rs`.
 const MIN_SWAP_AMOUNT: u64 = 10_000;
 
-/// Reduces a Core RPC endpoint to the bare `host:port` coinswap wants.
+/// Reduces a Core RPC endpoint to the bare `host:port` openswap wants.
 ///
-/// coinswap builds `http://{url}/wallet/{name}` itself, so a scheme here yields
+/// openswap builds `http://{url}/wallet/{name}` itself, so a scheme here yields
 /// `http://http://host:port/...` and a DNS error naming no cause.
 fn host_port(value: &str) -> String {
     let value = value.trim();
@@ -33,7 +33,7 @@ fn host_port(value: &str) -> String {
         .strip_prefix("http://")
         .or_else(|| value.strip_prefix("https://"))
         .unwrap_or(value);
-    // Anything after the host and port is a path, which coinswap appends itself.
+    // Anything after the host and port is a path, which openswap appends itself.
     value.split('/').next().unwrap_or(value).trim().to_string()
 }
 
@@ -106,7 +106,7 @@ impl Chain {
 /// Everything the operator configures, for both roles.
 ///
 /// Chain source and Tor settings are shared; everything else is per role, including the wallet
-/// name -- coinswap keeps maker and taker wallets as separate files with separate seeds.
+/// name -- openswap keeps maker and taker wallets as separate files with separate seeds.
 ///
 /// Both roles default to off: neither should start because somebody clicked install.
 // Every field carries a `label` and `help`, which is the operator-facing description and
@@ -128,7 +128,7 @@ pub struct Settings {
     pub backend: Backend,
 
     // --- Bitcoin Core, used when backend is CoreRpc ---
-    /// Normalised by [`host_port`] before it reaches coinswap.
+    /// Normalised by [`host_port`] before it reaches openswap.
     #[setting(
         label = "Core RPC host and port",
         help = "Host and port, for example 127.0.0.1:18443 . A http:// prefix is accepted and \
@@ -227,7 +227,7 @@ pub struct Settings {
 
     #[setting(
         label = "Fidelity bond timelock (blocks)",
-        help = "How long the bond stays locked, in blocks. coinswap accepts roughly three to six \
+        help = "How long the bond stays locked, in blocks. openswap accepts roughly three to six \
                 months; the exact range is reported if this is out of bounds."
     )]
     pub fidelity_timelock: u32,
@@ -262,7 +262,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        // coinswap's own defaults, except `enabled`.
+        // openswap's own defaults, except `enabled`.
         let reference = MakerServerConfig::default();
         Self {
             enabled: false,
@@ -310,7 +310,7 @@ impl Settings {
                             .to_string(),
                     );
                 }
-                // coinswap uses a plain http client, so a missing port silently becomes 80.
+                // openswap uses a plain http client, so a missing port silently becomes 80.
                 match endpoint.rsplit_once(':') {
                     Some((host, port))
                         if !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p != 0) => {}
@@ -340,7 +340,7 @@ impl Settings {
             if self.taker_wallet_name.trim().is_empty() {
                 return Err("Taker wallet name is required.".to_string());
             }
-            // Two coinswap wallets on one file, and one Bitcoin Core watch-only wallet driven by
+            // Two openswap wallets on one file, and one Bitcoin Core watch-only wallet driven by
             // both, each treating the other's coins as its own. Refuse rather than discover it.
             if self.taker_wallet_name.trim() == self.wallet_name.trim() {
                 return Err(
@@ -361,13 +361,13 @@ impl Settings {
             }
         }
 
-        // coinswap authenticates to Tor by password, so an empty one cannot work. Caught here
+        // openswap authenticates to Tor by password, so an empty one cannot work. Caught here
         // because its own failure is the opaque "Failed to retrieve ephemeral onion service
         // details".
         if self.tor_auth_password.is_empty() {
             return Err(
                 "Tor control password is required. Tor refuses to open a control port with no \
-                 authentication, and coinswap authenticates with a password, so this must match \
+                 authentication, and openswap authenticates with a password, so this must match \
                  the HashedControlPassword the Tor instance was configured with."
                     .to_string(),
             );
@@ -377,7 +377,7 @@ impl Settings {
             return Err(format!(
                 "Fidelity bond timelock must be between {MIN_FIDELITY_TIMELOCK} and \
                  {MAX_FIDELITY_TIMELOCK} blocks, which is roughly three to six months. \
-                 {} is outside what coinswap accepts.",
+                 {} is outside what openswap accepts.",
                 self.fidelity_timelock
             ));
         }
@@ -396,7 +396,7 @@ impl Settings {
         Ok(())
     }
 
-    /// The chain source, in the shape coinswap wants.
+    /// The chain source, in the shape openswap wants.
     ///
     /// Shared by both roles rather than built twice: they talk to the same node, and two copies
     /// of this would be two places for a change to be forgotten.
@@ -407,7 +407,7 @@ impl Settings {
     fn backend_config(&self, wallet_name: &str) -> BackendConfig {
         match self.backend {
             Backend::CoreRpc => BackendConfig::CoreRpc(CoreRpcConfig {
-                // Bare host:port, never a URL: coinswap adds the scheme and the wallet path.
+                // Bare host:port, never a URL: openswap adds the scheme and the wallet path.
                 url: host_port(&self.core_url),
                 auth: Auth::UserPass(self.core_user.clone(), self.core_password.clone()),
                 // The Core watch-only wallet this role drives, kept distinct from the other
@@ -432,7 +432,7 @@ impl Settings {
     /// wallet name and a separate data directory, so the two wallets cannot touch each other.
     pub fn to_taker_config(&self, data_dir: PathBuf) -> TakerInitConfig {
         // `..default()` for the same reason the maker's config uses it: `nostr_relays` and
-        // anything coinswap adds later keep coinswap's own value rather than whatever zero
+        // anything openswap adds later keep openswap's own value rather than whatever zero
         // happens to mean.
         TakerInitConfig {
             data_dir: Some(data_dir),
@@ -450,7 +450,7 @@ impl Settings {
 
     /// Builds the config the maker actually runs on.
     pub fn to_maker_config(&self, data_dir: PathBuf) -> MakerServerConfig {
-        // The trailing `..default()` keeps coinswap's own value for fields not set here, and
+        // The trailing `..default()` keeps openswap's own value for fields not set here, and
         // for anything it adds later.
         MakerServerConfig {
             data_dir,
@@ -549,9 +549,9 @@ mod tests {
 
     #[test]
     fn the_configured_data_dir_reaches_the_maker() {
-        // Otherwise the wallet lands in ~/.coinswap, outside the mounted volume, and is lost
+        // Otherwise the wallet lands in ~/.openswap, outside the mounted volume, and is lost
         // on the next deploy.
-        let dir = PathBuf::from("/var/lib/btcpay/plugins/coinswap");
+        let dir = PathBuf::from("/var/lib/btcpay/plugins/openswap");
         let config = valid().to_maker_config(dir.clone());
         assert_eq!(config.data_dir, dir);
     }
@@ -581,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn a_timelock_outside_what_coinswap_accepts_is_refused_at_save_time() {
+    fn a_timelock_outside_what_openswap_accepts_is_refused_at_save_time() {
         // Otherwise it is only caught when "Create fidelity bond" fails.
         for timelock in [0, MIN_FIDELITY_TIMELOCK - 1, MAX_FIDELITY_TIMELOCK + 1] {
             let settings = Settings {
@@ -599,7 +599,7 @@ mod tests {
     }
 
     #[test]
-    fn coinswaps_own_default_timelock_passes_the_check() {
+    fn openswaps_own_default_timelock_passes_the_check() {
         // Catches the mirrored bounds drifting from upstream. Goes through `valid()` because
         // `Settings::default()` deliberately does not pass: it has no Tor control password.
         let settings = valid();
@@ -658,7 +658,7 @@ mod tests {
 
     #[test]
     fn a_pasted_url_is_reduced_to_host_and_port() {
-        // Broke a live maker: coinswap prepends the scheme, yielding `http://http://...`.
+        // Broke a live maker: openswap prepends the scheme, yielding `http://http://...`.
         assert_eq!(
             host_port("http://bitcoind-signet:38332"),
             "bitcoind-signet:38332"
@@ -666,7 +666,7 @@ mod tests {
         assert_eq!(host_port("https://node.example:8332"), "node.example:8332");
         assert_eq!(host_port("  127.0.0.1:18443  "), "127.0.0.1:18443");
         assert_eq!(host_port("127.0.0.1:18443/"), "127.0.0.1:18443");
-        // coinswap appends the wallet path itself, so a supplied one has to go.
+        // openswap appends the wallet path itself, so a supplied one has to go.
         assert_eq!(
             host_port("http://127.0.0.1:18443/wallet/other"),
             "127.0.0.1:18443"
@@ -717,7 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn the_default_endpoint_is_in_the_format_coinswap_wants() {
+    fn the_default_endpoint_is_in_the_format_openswap_wants() {
         // The first version of this default carried a scheme.
         let default = Settings::default().core_url;
         assert!(!default.contains("://"), "default must not carry a scheme");

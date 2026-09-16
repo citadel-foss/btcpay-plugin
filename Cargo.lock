@@ -556,42 +556,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
-name = "coinswap"
-version = "0.2.2"
-source = "git+https://github.com/citadel-tech/coinswap?rev=20a0421e365d8624eba398da8779d1ad3098b793#20a0421e365d8624eba398da8779d1ad3098b793"
-dependencies = [
- "aes-gcm",
- "bip39",
- "bitcoin",
- "bitcoind",
- "clap",
- "crossbeam-channel",
- "crossterm",
- "dirs",
- "electrum-client",
- "log",
- "log4rs",
- "minreq",
- "nostr",
- "pbkdf2",
- "rust-coinselect",
- "rustls 0.23.43",
- "secp256k1 0.32.0-beta.2",
- "serde",
- "serde_cbor",
- "serde_json",
- "sha2",
- "tungstenite",
- "zmq",
-]
-
-[[package]]
 name = "coinswap-maker"
 version = "0.1.0"
 dependencies = [
  "btcpay-plugin",
- "coinswap",
  "log",
+ "openswap",
 ]
 
 [[package]]
@@ -1507,6 +1477,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
+name = "openswap"
+version = "0.2.2"
+source = "git+https://github.com/citadel-foss/openswap?rev=6f645621773024835f78260e4f086e970a8b371b#6f645621773024835f78260e4f086e970a8b371b"
+dependencies = [
+ "aes-gcm",
+ "bip39",
+ "bitcoin",
+ "bitcoind",
+ "clap",
+ "crossbeam-channel",
+ "crossterm",
+ "dirs",
+ "electrum-client",
+ "log",
+ "log4rs",
+ "minreq",
+ "nostr",
+ "pbkdf2",
+ "rust-coinselect",
+ "rustls 0.23.43",
+ "secp256k1 0.33.1",
+ "serde",
+ "serde_cbor",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tungstenite",
+ "zeroize",
+ "zmq",
+]
+
+[[package]]
 name = "ordered-float"
 version = "2.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1965,12 +1967,12 @@ dependencies = [
 
 [[package]]
 name = "secp256k1"
-version = "0.32.0-beta.2"
+version = "0.33.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c5fdc7d6e800869d3fd60ff857c479bf0a83ea7bf44b389e64461e844204994"
+checksum = "d7f404a8dab7a7a5a631e741d8699aa9c8e1d689fc26ccf897c7187565490b69"
 dependencies = [
  "rand 0.9.5",
- "secp256k1-sys 0.12.0",
+ "secp256k1-sys 0.14.1",
 ]
 
 [[package]]
@@ -1984,9 +1986,9 @@ dependencies = [
 
 [[package]]
 name = "secp256k1-sys"
-version = "0.12.0"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d3be00697c88c00fe102af8dc316038cc2062eab8da646e7463f4c0e70ca9fd"
+checksum = "f6b2992d4a3cd244539a7d5d0966aadbe5ca7fb868a5d7e38c29499b9e709bbd"
 dependencies = [
  "cc",
 ]
@@ -3081,6 +3083,20 @@ name = "zeroize"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
+dependencies = [
+ "zeroize_derive",
+]
+
+[[package]]
+name = "zeroize_derive"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c50655cbb0fe3fc43170059e702f1ce5e19b84cec58dc87b037a09935c2f328"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "zeromq-src"

@@ -12,7 +12,7 @@ name = "btcpay_plugin_native"
 [dependencies]
 btcpay-plugin = { git = "https://github.com/uqlidi/btcpay-rs" }
 
-coinswap = { git = "https://github.com/citadel-tech/coinswap", rev = "20a0421e365d8624eba398da8779d1ad3098b793" }
+openswap = { git = "https://github.com/citadel-foss/openswap", rev = "6f645621773024835f78260e4f086e970a8b371b" }
 
 log = "0.4"
 

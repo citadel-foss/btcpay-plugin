@@ -10,7 +10,7 @@
 
 ---
 
-A BTCPay Server plugin that runs a [coinswap](https://github.com/citadel-tech/coinswap) maker, a
+A BTCPay Server plugin that runs an [openswap](https://github.com/citadel-foss/openswap) maker, a
 taker, or both, next to your stores.
 
 - **Maker:** earns fees by offering swap liquidity. It holds a fidelity bond, advertises itself
@@ -27,8 +27,7 @@ BTCPay store wallet, so money in them is not money in a store. The plugin is wri
 **Experimental. Do not use it with real funds.** It has only been tested on signet, and:
 
 - Neither wallet is encrypted on disk.
-- It is pinned to coinswap revision `20a0421`, from before upstream renamed the crate to
-  `openswap`.
+- It is pinned to an openswap master revision rather than a released version.
 - No swap has completed end to end yet.
 
 ## Requirements

@@ -13,12 +13,12 @@ use std::time::Duration;
 
 use std::io::ErrorKind;
 
-use coinswap::bitcoin::Amount;
-use coinswap::error::NetError;
-use coinswap::protocol::common_messages::ProtocolVersion;
-use coinswap::taker::error::TakerError;
-use coinswap::taker::{SwapParams, Taker, TakerInitConfig};
-use coinswap::wallet::{AddressType, Balances};
+use openswap::bitcoin::Amount;
+use openswap::error::NetError;
+use openswap::protocol::common_messages::ProtocolVersion;
+use openswap::taker::error::TakerError;
+use openswap::taker::{SwapParams, Taker, TakerInitConfig};
+use openswap::wallet::{AddressType, Balances};
 
 use crate::shared::{describe, lock, Logger, Phase, SendOnDrop};
 
@@ -34,7 +34,7 @@ pub struct QuoteHop {
 
 /// What a swap would cost, before anything is committed.
 ///
-/// Owned rather than holding coinswap's `SwapSummary`, so rendering it needs no lock.
+/// Owned rather than holding openswap's `SwapSummary`, so rendering it needs no lock.
 pub struct Quote {
     /// Identifies the prepared swap, and is what executing it will refer to.
     pub swap_id: String,
@@ -50,7 +50,7 @@ pub struct Quote {
 
 /// Where the quote has got to.
 ///
-/// `prepare_coinswap` syncs the offerbook over Tor and waits on Nostr discovery, far too long
+/// `prepare_swap` syncs the offerbook over Tor and waits on Nostr discovery, far too long
 /// for the operator's request, so it runs on a thread and the page reports what it finds.
 pub enum QuoteState {
     /// No quote has been asked for.
@@ -65,9 +65,9 @@ pub enum QuoteState {
 
 /// How a finished swap turned out.
 pub struct SwapOutcome {
-    /// Identifies the swap coinswap reported on.
+    /// Identifies the swap openswap reported on.
     pub swap_id: String,
-    /// How coinswap classified the end of it.
+    /// How openswap classified the end of it.
     pub status: String,
     /// What left the wallet, in satoshis.
     pub sent_sat: u64,
@@ -219,7 +219,7 @@ impl TakerRuntime {
         }
 
         let thread = std::thread::Builder::new()
-            .name("coinswap-taker".to_string())
+            .name("openswap-taker".to_string())
             .spawn({
                 let shared = Arc::clone(&self.shared);
                 let stop_requested = Arc::clone(&stop_requested);
@@ -260,7 +260,7 @@ impl TakerRuntime {
                         return;
                     }
 
-                    // coinswap's taker binary syncs here too. `Taker::init` does not, so
+                    // openswap's taker binary syncs here too. `Taker::init` does not, so
                     // without this the wallet has no chain state and a funded wallet reports a
                     // zero balance.
                     log.info("Scanning the chain for the taker's coins.");
@@ -416,7 +416,7 @@ impl TakerRuntime {
 
     /// Asks the makers what a swap would cost, on a thread.
     ///
-    /// Nothing is committed: coinswap negotiates, reserves a swap id and stops, so the operator
+    /// Nothing is committed: openswap negotiates, reserves a swap id and stops, so the operator
     /// can see the fee before deciding.
     pub fn request_quote(
         &self,
@@ -454,7 +454,7 @@ impl TakerRuntime {
 
         let shared = Arc::clone(&self.shared);
         std::thread::Builder::new()
-            .name("coinswap-quote".to_string())
+            .name("openswap-quote".to_string())
             .spawn(move || {
                 // Legacy is what the makers on this network negotiated; Taproot needs something
                 // to test against first.
@@ -473,7 +473,7 @@ impl TakerRuntime {
                 // busy rather than queueing.
                 let outcome = match handle.lock() {
                     Ok(mut taker) => sync_wallet(&taker).and_then(|()| {
-                        taker.prepare_coinswap(params).map_err(|error| {
+                        taker.prepare_swap(params).map_err(|error| {
                             log.error(&format!("Quote failed: {}", describe(&error)));
                             explain(&error)
                         })
@@ -552,7 +552,7 @@ impl TakerRuntime {
     /// Whether an earlier swap is still being recovered.
     ///
     /// `None` when undetermined, which callers treat as "do not block": refusing on a reading
-    /// we could not take would strand the operator. coinswap drives the recovery itself; this
+    /// we could not take would strand the operator. openswap drives the recovery itself; this
     /// only reads it.
     pub fn recovery_pending(&self) -> Option<bool> {
         let handle = lock(&self.shared).taker.clone()?;
@@ -607,7 +607,7 @@ impl TakerRuntime {
         let shared = Arc::clone(&self.shared);
         let started = swap_id.clone();
         std::thread::Builder::new()
-            .name("coinswap-swap".to_string())
+            .name("openswap-swap".to_string())
             .spawn(move || {
                 log.info(&format!(
                     "Starting swap {started}. Funds are committed on chain from here; leave \
@@ -617,7 +617,7 @@ impl TakerRuntime {
                 let outcome = match handle.lock() {
                     Ok(mut taker) => {
                         let before = wallet_totals(&taker);
-                        taker.start_coinswap(&started).map_err(|error| {
+                        taker.start_swap(&started).map_err(|error| {
                             log.error(&format!("Swap {started} failed: {}", describe(&error)));
                             // Synced first: without it the balances are whatever they were
                             // before the swap, and every failure would read as nothing moved.
@@ -729,7 +729,7 @@ impl TakerRuntime {
     fn with_wallet_mut<T>(
         &self,
         what: &str,
-        body: impl FnOnce(&mut coinswap::wallet::Wallet) -> Result<T, String>,
+        body: impl FnOnce(&mut openswap::wallet::Wallet) -> Result<T, String>,
     ) -> Result<T, String> {
         let handle = lock(&self.shared).taker.clone();
         let Some(handle) = handle else {
@@ -773,7 +773,7 @@ fn funds_moved(before: (u64, u64), after: (u64, u64)) -> bool {
 
 /// What went wrong with a quote or a swap, in words an operator can act on.
 ///
-/// coinswap's errors have no `Display`, and their debug form names Rust types. The raw form
+/// openswap's errors have no `Display`, and their debug form names Rust types. The raw form
 /// still goes to the log.
 fn explain(error: &TakerError) -> String {
     const HUNG_UP: &str = "a maker on the route closed the connection partway through.";
@@ -936,7 +936,7 @@ mod tests {
 
     #[test]
     fn a_second_quote_is_refused_while_one_is_being_prepared() {
-        // `prepare_coinswap` holds the taker throughout, so a second request would queue
+        // `prepare_swap` holds the taker throughout, so a second request would queue
         // invisibly rather than being told no.
         let runtime = TakerRuntime::new();
         lock(&runtime.shared).quote = QuoteState::Preparing;

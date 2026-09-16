@@ -1,7 +1,7 @@
 //! Owns the maker's lifecycle: starting it, stopping it inside a deadline, and reporting what
 //! it is doing.
 //!
-//! Two coinswap properties drive the design: `MakerServer::init` can hang for tens of seconds,
+//! Two openswap properties drive the design: `MakerServer::init` can hang for tens of seconds,
 //! so it runs on the maker's own thread and errors surface on the dashboard rather than failing
 //! `Plugin::start`; and `start_server` blocks for the maker's whole life, so it is the thread
 //! body rather than a call that returns.
@@ -17,10 +17,10 @@ use crate::shared::{
     describe, lock, sleep_unless_stopped, unix_now, Logger, Phase, SendOnDrop, RETRY_BACKOFF,
     START_ATTEMPTS,
 };
-use coinswap::maker::swap_tracker::{MakerRecoveryPhase, MakerSwapPhase};
-use coinswap::maker::{start_server, MakerServer, MakerServerConfig};
-use coinswap::utill::check_tor_status;
-use coinswap::wallet::{AddressType, Balances, Wallet};
+use openswap::maker::swap_tracker::{MakerRecoveryPhase, MakerSwapPhase};
+use openswap::maker::{start_server, MakerServer, MakerServerConfig};
+use openswap::utill::check_tor_status;
+use openswap::wallet::{AddressType, Balances, Wallet};
 
 /// State both the maker thread and the plugin touch.
 ///
@@ -101,7 +101,7 @@ impl MakerRuntime {
         }
 
         let thread = std::thread::Builder::new()
-            .name("coinswap-maker".to_string())
+            .name("openswap-maker".to_string())
             .spawn({
                 let shared = Arc::clone(&self.shared);
                 let stop_requested = Arc::clone(&stop_requested);
@@ -156,7 +156,7 @@ impl MakerRuntime {
                             return;
                         }
 
-                        // coinswap reports "Failed to retrieve ephemeral onion service details"
+                        // openswap reports "Failed to retrieve ephemeral onion service details"
                         // whether Tor is absent, rejected the password, or refused the key. This
                         // separates those cases.
                         tor = check_tor_status(
@@ -193,7 +193,7 @@ impl MakerRuntime {
                     }
 
                     // `start_server` only returns on failure, so setting Running before the call
-                    // is the closest thing to a "started" signal coinswap offers.
+                    // is the closest thing to a "started" signal openswap offers.
                     let outcome = match tor {
                         Ok(()) => {
                             lock(&shared).phase = Phase::Running;
@@ -302,7 +302,7 @@ impl MakerRuntime {
             return Status::without_maker(phase);
         };
 
-        // `try_read`, never `read`: coinswap holds the wallet's write lock across a chain sync
+        // `try_read`, never `read`: openswap holds the wallet's write lock across a chain sync
         // while waiting for the bond to be funded, which is indefinite on an unfunded maker.
         let (balances, bonds, wallet_busy) = match maker.wallet.try_read() {
             Ok(wallet) => (
@@ -392,7 +392,7 @@ impl MakerRuntime {
     /// Marks a stale unfinished swap as dealt with, so the dashboard and notifications stop
     /// reporting it.
     ///
-    /// Changes the tracker record only. The coins stay where they are, and coinswap's recovery
+    /// Changes the tracker record only. The coins stay where they are, and openswap's recovery
     /// is unaffected: it works from the wallet's swapcoins and reads just `funding_broadcast`
     /// here, which this leaves alone.
     pub fn dismiss_swap(&self, id: &str) -> Result<String, String> {
@@ -445,7 +445,7 @@ impl MakerRuntime {
         // `try_write` for the same reason `status` uses `try_read`.
         let mut wallet = maker.wallet.try_write().map_err(|_| {
             "The maker is busy syncing its wallet, so it cannot derive an address right now. \
-             coinswap logs the address it wants funded to BTCPay's log, which needs no lock."
+             openswap logs the address it wants funded to BTCPay's log, which needs no lock."
                 .to_string()
         })?;
 
@@ -507,13 +507,13 @@ impl Default for MakerRuntime {
 pub struct SwapRecord {
     /// The full identifier the tracker is keyed by.
     pub tracker_key: String,
-    /// When coinswap last changed this record, in Unix seconds.
+    /// When openswap last changed this record, in Unix seconds.
     pub updated_at: u64,
-    /// Short identifier, as coinswap logs it.
+    /// Short identifier, as openswap logs it.
     pub id: String,
-    /// coinswap's swap phase, under the name coinswap gives it.
+    /// openswap's swap phase, under the name openswap gives it.
     pub phase: String,
-    /// coinswap's recovery phase, under the name coinswap gives it.
+    /// openswap's recovery phase, under the name openswap gives it.
     pub recovery: String,
     /// Swap amount, in satoshis.
     pub amount_sat: u64,

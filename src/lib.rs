@@ -13,7 +13,7 @@
 //! - [`maker`] owns the maker's thread.
 //! - [`taker`] owns the taker's wallet, a separate wallet from the maker's.
 //! - [`shared`] is what both roles need: the phase, the logger, the lock helpers.
-//! - [`logging`] routes coinswap's own log output into BTCPay's.
+//! - [`logging`] routes openswap's own log output into BTCPay's.
 //! - This module is the glue: pages, commands, and reacting to a settings change.
 
 #![deny(missing_docs)]
@@ -53,7 +53,7 @@ const STOP_DEADLINE: Duration = Duration::from_secs(30);
 /// Where a notification sends the operator.
 ///
 /// The route `cargo btcpay` generates from the plugin identifier, plus the dashboard page id.
-const DASHBOARD_LINK: &str = "/plugins/btcpayserver-plugins-coinswap/dashboard";
+const DASHBOARD_LINK: &str = "/plugins/btcpayserver-plugins-openswap/dashboard";
 
 /// The plugin.
 #[derive(Default)]
@@ -190,7 +190,7 @@ impl CoinswapPlugin {
             page = page.alert(
                 AlertLevel::Warning,
                 "A previous swap is still being recovered, so its funds are in contracts until \
-                 their timelocks expire. coinswap does this itself and needs nothing from you; \
+                 their timelocks expire. openswap does this itself and needs nothing from you; \
                  a new swap is refused until it finishes, because starting one now would commit \
                  funds on top of funds already committed.",
             );
@@ -615,7 +615,7 @@ impl CoinswapPlugin {
         }
 
         // No fidelity bond command: the bond commits to the maker's onion hostname, which comes
-        // from a private coinswap method. A button here could only lock funds into an address no
+        // from a private openswap method. A button here could only lock funds into an address no
         // taker would use. Renewal happens on the next start.
 
         actions
@@ -853,7 +853,7 @@ impl CoinswapPlugin {
 #[btcpay_plugin::plugin(identifier = "BTCPayServer.Plugins.Coinswap", name = "Coinswap")]
 impl Plugin for CoinswapPlugin {
     fn start(&self, host: Arc<dyn HostServices>) -> Result<(), PluginError> {
-        // Before anything that could fail, so coinswap's account of it is not discarded.
+        // Before anything that could fail, so openswap's account of it is not discarded.
         logging::install(Arc::clone(&host));
 
         let settings = Settings::load(host.as_ref());
