@@ -11,6 +11,7 @@ use openswap::{
     bitcoin::Network,
     bitcoind::bitcoincore_rpc::Auth,
     maker::MakerServerConfig,
+    protocol::common_messages::ProtocolVersion,
     taker::{api::ConnectionType, TakerInitConfig},
     wallet::{BackendConfig, CoreRpcConfig, ElectrumConfig},
 };
@@ -56,6 +57,28 @@ impl Reach {
         match self {
             Reach::Tor => ConnectionType::Tor,
             Reach::Clearnet => ConnectionType::Clearnet,
+        }
+    }
+}
+
+/// Which swap protocol the taker asks for.
+#[derive(BtcpayChoice, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Protocol {
+    /// ECDSA contracts with script-evaluated HTLCs. Every maker supports it.
+    #[default]
+    #[choice(value = "legacy", label = "Legacy")]
+    Legacy,
+    /// Taproot MuSig2 with scriptless contracts. Only makers advertising it are eligible,
+    /// which is most of them: a maker that supports both advertises "Unified".
+    #[choice(value = "taproot", label = "Taproot")]
+    Taproot,
+}
+
+impl Protocol {
+    pub(crate) fn to_protocol_version(self) -> ProtocolVersion {
+        match self {
+            Protocol::Legacy => ProtocolVersion::Legacy,
+            Protocol::Taproot => ProtocolVersion::Taproot,
         }
     }
 }
@@ -258,6 +281,13 @@ pub struct Settings {
                 local test against a maker that is not behind Tor."
     )]
     pub taker_reach: Reach,
+
+    #[setting(
+        label = "Swap protocol",
+        help = "Which protocol the taker asks makers for. Legacy is the older path every maker \
+                supports. Taproot needs makers that advertise it."
+    )]
+    pub taker_protocol: Protocol,
 }
 
 impl Default for Settings {
@@ -287,6 +317,7 @@ impl Default for Settings {
             fidelity_amount: reference.fidelity_amount as u32,
             fidelity_timelock: reference.fidelity_timelock,
             taker_enabled: false,
+            taker_protocol: Protocol::Legacy,
             // Distinct from the maker's default on purpose: one wallet name for two wallets
             // would be an operator's worst afternoon.
             taker_wallet_name: "btcpay-taker".to_string(),
@@ -794,5 +825,24 @@ mod tests {
     fn the_taker_reaches_makers_over_tor_by_default() {
         // A maker advertises an onion address, which clearnet cannot reach at all.
         assert_eq!(Settings::default().taker_reach, Reach::Tor);
+    }
+
+    #[test]
+    fn the_swap_protocol_defaults_to_legacy() {
+        // Every maker supports Legacy, so an operator who never touches this gets a swap that
+        // can route. Taproot is opt-in.
+        assert_eq!(Settings::default().taker_protocol, Protocol::Legacy);
+    }
+
+    #[test]
+    fn both_protocols_map_to_openswaps_own_type() {
+        assert_eq!(
+            Protocol::Legacy.to_protocol_version(),
+            ProtocolVersion::Legacy
+        );
+        assert_eq!(
+            Protocol::Taproot.to_protocol_version(),
+            ProtocolVersion::Taproot
+        );
     }
 }

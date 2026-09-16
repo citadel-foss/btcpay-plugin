@@ -422,6 +422,7 @@ impl TakerRuntime {
         &self,
         send_sat: u64,
         maker_count: usize,
+        protocol: ProtocolVersion,
         log: Logger,
     ) -> Result<(), String> {
         if send_sat == 0 {
@@ -456,13 +457,7 @@ impl TakerRuntime {
         std::thread::Builder::new()
             .name("openswap-quote".to_string())
             .spawn(move || {
-                // Legacy is what the makers on this network negotiated; Taproot needs something
-                // to test against first.
-                let params = SwapParams::new(
-                    ProtocolVersion::Legacy,
-                    Amount::from_sat(send_sat),
-                    maker_count,
-                );
+                let params = SwapParams::new(protocol, Amount::from_sat(send_sat), maker_count);
 
                 log.info(&format!(
                     "Preparing a quote for {send_sat} sats across {maker_count} maker(s). This \
@@ -899,7 +894,9 @@ mod tests {
     #[test]
     fn a_quote_is_refused_before_the_wallet_is_open() {
         let runtime = TakerRuntime::new();
-        assert!(runtime.request_quote(100_000, 2, Logger::silent()).is_err());
+        assert!(runtime
+            .request_quote(100_000, 2, ProtocolVersion::Legacy, Logger::silent())
+            .is_err());
     }
 
     #[test]
@@ -907,11 +904,11 @@ mod tests {
         // Checked before the wallet, so the message names the real problem.
         let runtime = TakerRuntime::new();
         assert!(runtime
-            .request_quote(0, 2, Logger::silent())
+            .request_quote(0, 2, ProtocolVersion::Legacy, Logger::silent())
             .unwrap_err()
             .contains("amount"));
         assert!(runtime
-            .request_quote(100_000, 0, Logger::silent())
+            .request_quote(100_000, 0, ProtocolVersion::Legacy, Logger::silent())
             .unwrap_err()
             .contains("maker"));
     }
@@ -942,7 +939,7 @@ mod tests {
         lock(&runtime.shared).quote = QuoteState::Preparing;
 
         let err = runtime
-            .request_quote(100_000, 2, Logger::silent())
+            .request_quote(100_000, 2, ProtocolVersion::Legacy, Logger::silent())
             .unwrap_err();
 
         // Says "wallet not open" only because this runtime has none; the guard order is what
@@ -981,7 +978,7 @@ mod tests {
         };
 
         let err = runtime
-            .request_quote(100_000, 2, Logger::silent())
+            .request_quote(100_000, 2, ProtocolVersion::Legacy, Logger::silent())
             .unwrap_err();
         assert!(err.contains("swap is running"), "{err}");
     }

@@ -713,6 +713,7 @@ impl CoinswapPlugin {
                 .and_then(|raw| raw.trim().parse::<u64>().ok())
         };
 
+        let settings = self.settings();
         let outcome = match (number("sats"), number("makers")) {
             (Some(sats), Some(makers)) => {
                 let logger = match self.host() {
@@ -725,7 +726,12 @@ impl CoinswapPlugin {
                     }
                 };
                 self.taker
-                    .request_quote(sats, makers as usize, logger)
+                    .request_quote(
+                        sats,
+                        makers as usize,
+                        settings.taker_protocol.to_protocol_version(),
+                        logger,
+                    )
                     .map(|()| {
                         "Preparing a quote. It asks makers over Tor, so reload in a moment."
                             .to_string()
