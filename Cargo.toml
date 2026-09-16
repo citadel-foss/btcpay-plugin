@@ -1,8 +1,8 @@
 [package]
-name = "coinswap-maker"
+name = "openswap-plugin"
 version = "0.1.0"
 edition = "2021"
-description = "Run a coinswap maker inside BTCPay Server."
+description = "Run openswap maker/taker inside BTCPay Server."
 license = "MIT"
 
 [lib]

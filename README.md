@@ -1,8 +1,8 @@
 <div align="center">
 
-<img src="assets/coinswap.btcpay.svg" alt="Coinswap" width="140">
+<img src="assets/openswap.btcpay.svg" alt="Openswap" width="140">
 
-<h2>Coinswap for BTCPay Server.</h2>
+<h2>Openswap for BTCPay Server.</h2>
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
 
