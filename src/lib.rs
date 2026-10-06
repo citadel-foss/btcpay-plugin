@@ -105,7 +105,9 @@ impl CoinswapPlugin {
     fn coin_tables(page: Document, coins: &[Coin]) -> Document {
         let mut ledger = Table::new(["Amount", "Holding", "Confirmations", "Address", "Outpoint"])
             .title("Coins")
-            .empty_message("No coins. Send to the funding address below to top this wallet up.");
+            .empty_message("No coins. Send to the funding address below to top this wallet up.")
+            // Open: what the wallet holds is the point of the page.
+            .collapsed(false);
         for coin in coins {
             ledger = ledger.row([
                 Self::sats(coin.amount_sat),
@@ -126,7 +128,9 @@ impl CoinswapPlugin {
         }
         let mut addresses = Table::new(["Address", "Coins", "Total"])
             .title("Addresses holding coins")
-            .empty_message("Nothing received yet.");
+            .empty_message("Nothing received yet.")
+            // Folded: a second view of the same coins, wanted only when checking a deposit.
+            .collapsed(true);
         for (address, (total, count)) in totals {
             addresses = addresses.row([address.to_string(), count.to_string(), Self::sats(total)]);
         }
