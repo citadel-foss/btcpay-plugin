@@ -28,6 +28,7 @@ pub mod taker;
 #[cfg(test)]
 mod testing;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -37,13 +38,21 @@ use btcpay_plugin::prelude::*;
 use alerts::{Watcher, WatcherSlot};
 use maker::{MakerRuntime, Status};
 use settings::Settings;
-use shared::{lock, unix_now, Logger, Phase};
+use shared::{lock, unix_now, Coin, Logger, Phase};
 use taker::{QuoteState, SwapState, TakerRuntime};
 
 /// How long a drain command waits for an idle swap to wind up.
 ///
 /// Short, because the command runs inside the operator's request.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Where each role's last funding address is remembered.
+///
+/// Stored rather than derived per page load: deriving advances the address index and writes the
+/// wallet to disk, so rendering the page would burn an address on every refresh and widen the
+/// gap a later wallet scan has to cover.
+const TAKER_ADDRESS_KEY: &str = "taker_funding_address";
+const MAKER_ADDRESS_KEY: &str = "maker_funding_address";
 
 /// How long a stop waits for the maker before giving up on it.
 ///
@@ -71,6 +80,58 @@ pub struct CoinswapPlugin {
 impl CoinswapPlugin {
     fn host(&self) -> Option<Arc<dyn HostServices>> {
         lock(&self.host).clone()
+    }
+
+    /// The funding address last handed out for `key`, if there was one.
+    fn stored_address(&self, key: &str) -> Option<String> {
+        let host = self.host()?;
+        host.store_get(key.to_string())
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+    }
+
+    /// Remembers a freshly derived funding address, so the page can show it again without
+    /// deriving another one.
+    fn remember_address(&self, key: &str, address: &str) {
+        if let Some(host) = self.host() {
+            let _ = host.store_put(key.to_string(), address.as_bytes().to_vec());
+        }
+    }
+
+    /// The wallet's coins, and the addresses holding them.
+    ///
+    /// Two views of one list: the coins answer what the wallet can spend, the addresses answer
+    /// where a deposit landed. Only addresses holding coins appear, because openswap exposes no
+    /// way to enumerate a wallet's addresses; the coins are what know where they sit.
+    fn coin_tables(page: Document, coins: &[Coin]) -> Document {
+        let mut ledger = Table::new(["Amount", "Holding", "Confirmations", "Address", "Outpoint"])
+            .title("Coins")
+            .empty_message("No coins. Send to the funding address below to top this wallet up.");
+        for coin in coins {
+            ledger = ledger.row([
+                Self::sats(coin.amount_sat),
+                coin.kind.to_string(),
+                coin.confirmations.to_string(),
+                coin.address.clone(),
+                coin.outpoint.clone(),
+            ]);
+        }
+
+        // Summed per address rather than one row per coin: an address funded twice is one place
+        // with one total, which is what an operator checking a deposit is looking for.
+        let mut totals: BTreeMap<&str, (u64, usize)> = BTreeMap::new();
+        for coin in coins {
+            let entry = totals.entry(coin.address.as_str()).or_insert((0, 0));
+            entry.0 += coin.amount_sat;
+            entry.1 += 1;
+        }
+        let mut addresses = Table::new(["Address", "Coins", "Total"])
+            .title("Addresses holding coins")
+            .empty_message("Nothing received yet.");
+        for (address, (total, count)) in totals {
+            addresses = addresses.row([address.to_string(), count.to_string(), Self::sats(total)]);
+        }
+
+        page.table(ledger).table(addresses)
     }
 
     fn settings(&self) -> Settings {
@@ -213,6 +274,7 @@ impl CoinswapPlugin {
         }
 
         page = page.stats(stats);
+        page = Self::coin_tables(page, &status.coins);
 
         match self.taker.swap_state() {
             SwapState::Idle => {}
@@ -351,11 +413,18 @@ impl CoinswapPlugin {
         // Nothing needing the taker is offered while a swap holds it; both would fail on the
         // lock.
         if self.taker.wallet_open() && !self.taker.swap_running() {
+            // Read from storage, never derived here, so a refresh cannot advance the index.
+            if let Some(address) = self.stored_address(TAKER_ADDRESS_KEY) {
+                page = page.stats(Stats::new().card("Funding address", address).detail(
+                    "Send here to top up the taker wallet. It stays until you ask for another.",
+                ));
+            }
+
             page = page
                 .actions(
                     Actions::new()
                         .title("Funding")
-                        .button(Button::new("taker-address", "Show a funding address").primary()),
+                        .button(Button::new("taker-address", "New funding address").primary()),
                 )
                 // A form, not a command: a button carries neither address nor amount. Arrives
                 // as `FormSubmitted` because its id is not "settings".
@@ -485,7 +554,15 @@ impl CoinswapPlugin {
             },
         );
 
+        // Read from storage, never derived here, so a refresh cannot advance the index.
+        if let Some(address) = self.stored_address(MAKER_ADDRESS_KEY) {
+            stats = stats
+                .card("Funding address", address)
+                .detail("Send here to fund the maker. It stays until you ask for another.");
+        }
+
         page = page.stats(stats);
+        page = Self::coin_tables(page, &status.coins);
 
         // Swaps first when any still has money on chain: funds sit in a contract until a
         // timelock releases them, and nothing else on this page would say so.
@@ -611,7 +688,7 @@ impl CoinswapPlugin {
         // Offered whenever the wallet is open, including after a failed start: the maker cannot
         // start without a funded wallet, so withholding an address would deadlock.
         if self.maker.wallet_open() {
-            actions = actions.button(Button::new("address", "Show a funding address"));
+            actions = actions.button(Button::new("address", "New funding address"));
         }
 
         // No fidelity bond command: the bond commits to the maker's onion hostname, which comes
@@ -812,15 +889,17 @@ impl CoinswapPlugin {
                 Ok("Quote discarded.".to_string())
             }
             "taker-address" => self.taker.receive_address().map(|address| {
+                self.remember_address(TAKER_ADDRESS_KEY, &address);
                 format!(
-                    "Send funds to {address} to top up the taker wallet. This is the taker's own \
-                     wallet, not a store wallet. The address advances each time."
+                    "New funding address: {address}. It stays on this page until you ask for \
+                     another. This is the taker's own wallet, not a store wallet."
                 )
             }),
             "address" => self.maker.receive_address().map(|address| {
+                self.remember_address(MAKER_ADDRESS_KEY, &address);
                 format!(
-                    "Send funds to {address} -- this is the maker's own wallet, not a store \
-                     wallet. The address advances each time, so take a fresh one per deposit."
+                    "New funding address: {address}. It stays on the dashboard until you ask for \
+                     another. This is the maker's own wallet, not a store wallet."
                 )
             }),
             "drain" => self.maker.drain_idle_swaps(DRAIN_TIMEOUT).map(|count| {

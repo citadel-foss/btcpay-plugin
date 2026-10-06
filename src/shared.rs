@@ -1,5 +1,7 @@
 //! Pieces the maker and the taker both need.
 
+use openswap::wallet::{UTXOSpendInfo, Wallet};
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -99,5 +101,56 @@ impl Logger {
 
     pub(crate) fn error(&self, message: &str) {
         (self.0)(true, message)
+    }
+}
+
+/// One unspent output, in the shape a page prints it.
+///
+/// Flattened rather than handing openswap's own types to a page: printing a row should not
+/// require knowing what a `UTXOSpendInfo` is.
+pub struct Coin {
+    /// What the coin is worth, in satoshis.
+    pub amount_sat: u64,
+    /// What the coin is doing: spendable, mid-swap, held in a contract, or bonded.
+    pub kind: &'static str,
+    /// Confirmations behind it. Zero means it is still in the mempool.
+    pub confirmations: u32,
+    /// The address holding it, or `-` when the entry carries none.
+    pub address: String,
+    /// `txid:vout`, the coin's identity on chain.
+    pub outpoint: String,
+}
+
+/// Every unspent output, flattened for the page and largest first.
+pub fn coins_of(wallet: &Wallet) -> Vec<Coin> {
+    let mut coins: Vec<Coin> = wallet
+        .list_all_utxo_spend_info()
+        .into_iter()
+        .map(|(utxo, info)| Coin {
+            amount_sat: utxo.amount.to_sat(),
+            kind: kind_of(&info),
+            confirmations: utxo.confirmations,
+            // A watch-only entry can lack an address; the outpoint still identifies the coin.
+            address: utxo.address.map_or_else(
+                || "-".to_string(),
+                |address| address.assume_checked().to_string(),
+            ),
+            outpoint: format!("{}:{}", utxo.txid, utxo.vout),
+        })
+        .collect();
+    coins.sort_by_key(|coin| std::cmp::Reverse(coin.amount_sat));
+    coins
+}
+
+/// What a coin is doing, in words rather than openswap's type names.
+fn kind_of(info: &UTXOSpendInfo) -> &'static str {
+    match info {
+        UTXOSpendInfo::SeedCoin { .. } => "Spendable",
+        UTXOSpendInfo::IncomingSwapCoin { .. } => "From a swap",
+        UTXOSpendInfo::OutgoingSwapCoin { .. } => "Sent in a swap",
+        UTXOSpendInfo::TimelockContract { .. } => "Timelock contract",
+        UTXOSpendInfo::HashlockContract { .. } => "Hashlock contract",
+        UTXOSpendInfo::FidelityBondCoin { .. } => "Fidelity bond",
+        UTXOSpendInfo::SweptCoin { .. } => "Swept",
     }
 }
