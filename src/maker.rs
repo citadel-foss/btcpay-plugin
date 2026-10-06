@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use crate::alerts::Observation;
 use crate::shared::{
-    describe, lock, sleep_unless_stopped, unix_now, Logger, Phase, SendOnDrop, RETRY_BACKOFF,
-    START_ATTEMPTS,
+    coins_of, describe, lock, sleep_unless_stopped, unix_now, Coin, Logger, Phase, SendOnDrop,
+    RETRY_BACKOFF, START_ATTEMPTS,
 };
 use openswap::maker::swap_tracker::{MakerRecoveryPhase, MakerSwapPhase};
 use openswap::maker::{start_server, MakerServer, MakerServerConfig};
@@ -304,7 +304,7 @@ impl MakerRuntime {
 
         // `try_read`, never `read`: openswap holds the wallet's write lock across a chain sync
         // while waiting for the bond to be funded, which is indefinite on an unfunded maker.
-        let (balances, bonds, wallet_busy) = match maker.wallet.try_read() {
+        let (balances, bonds, coins, wallet_busy) = match maker.wallet.try_read() {
             Ok(wallet) => (
                 wallet.get_balances().ok(),
                 wallet
@@ -312,9 +312,10 @@ impl MakerRuntime {
                     .iter()
                     .map(|bond| (bond.amount.to_sat(), bond.lock_time.to_string()))
                     .collect(),
+                coins_of(&wallet),
                 false,
             ),
-            Err(_) => (None, Vec::new(), true),
+            Err(_) => (None, Vec::new(), Vec::new(), true),
         };
 
         // No `check_swap_liquidity` here: it makes RPC calls, and a page render must not.
@@ -345,6 +346,7 @@ impl MakerRuntime {
             wallet_busy,
             port: Some(maker.config.network_port),
             swaps,
+            coins,
         }
     }
 
@@ -561,6 +563,8 @@ pub struct Status {
     pub port: Option<u16>,
     /// Swaps the maker has records for, newest first. Empty when it has none or was busy.
     pub swaps: Vec<SwapRecord>,
+    /// Every unspent output the wallet holds. Empty when it could not be read.
+    pub coins: Vec<Coin>,
 }
 
 impl Status {
@@ -573,6 +577,7 @@ impl Status {
             wallet_busy: false,
             port: None,
             swaps: Vec::new(),
+            coins: Vec::new(),
         }
     }
 }

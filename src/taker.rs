@@ -20,7 +20,7 @@ use openswap::taker::error::TakerError;
 use openswap::taker::{SwapParams, Taker, TakerInitConfig};
 use openswap::wallet::{AddressType, Balances};
 
-use crate::shared::{describe, lock, Logger, Phase, SendOnDrop};
+use crate::shared::{coins_of, describe, lock, Coin, Logger, Phase, SendOnDrop};
 
 /// One hop of a quote: the maker at that position and what it charges.
 pub struct QuoteHop {
@@ -151,6 +151,8 @@ pub struct Status {
     ///
     /// `None` when undetermined. A half-finished swap leaves funds in timelocked contracts.
     pub recovery_complete: Option<bool>,
+    /// Every unspent output the wallet holds. Empty when it could not be read.
+    pub coins: Vec<Coin>,
 }
 
 impl Status {
@@ -160,6 +162,7 @@ impl Status {
             balances: None,
             wallet_busy: false,
             recovery_complete: None,
+            coins: Vec::new(),
         }
     }
 }
@@ -366,6 +369,7 @@ impl TakerRuntime {
                 balances: None,
                 wallet_busy: true,
                 recovery_complete: None,
+                coins: Vec::new(),
             },
             Ok(taker) => {
                 let recovery_complete = Some(taker.is_recovery_complete());
@@ -375,12 +379,14 @@ impl TakerRuntime {
                         balances: wallet.get_balances().ok(),
                         wallet_busy: false,
                         recovery_complete,
+                        coins: coins_of(&wallet),
                     },
                     Err(_) => Status {
                         phase,
                         balances: None,
                         wallet_busy: true,
                         recovery_complete,
+                        coins: Vec::new(),
                     },
                 }
             }
