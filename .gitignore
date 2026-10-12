@@ -2,3 +2,6 @@
 
 # Build output: the C# project and the packaged plugin are generated, never edited.
 /artifacts
+
+# Python CI helper bytecode.
+__pycache__/
